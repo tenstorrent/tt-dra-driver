@@ -1,0 +1,16 @@
+.cache/
+vendor/
+[._]*.sw[a-p]
+
+# Local build artifacts
+/bin/
+/dist/
+/tt-dra-driver-kubeletplugin
+
+driver_image.tar
+*.tgz
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
