@@ -1,0 +1,9 @@
+---
+apiVersion: {{ include "tt-dra-driver.resourceApiVersion" . }}
+kind: DeviceClass
+metadata:
+  name: {{ include "tt-dra-driver.driverName" . }}
+spec:
+  selectors:
+  - cel:
+      expression: "device.driver == '{{ include "tt-dra-driver.driverName" . }}'"
