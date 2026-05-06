@@ -71,7 +71,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		return nil, fmt.Errorf("error enumerating all possible devices: %v", err)
 	}
 
-	cdi, err := NewCDIHandler(config.flags.cdiRoot, config.flags.driverName, config.flags.profile)
+	cdi, err := NewCDIHandler(config.flags.cdiRoot, config.flags.driverName, config.flags.profile, config.profile.CommonContainerEdits())
 	if err != nil {
 		return nil, fmt.Errorf("unable to create CDI handler: %v", err)
 	}
