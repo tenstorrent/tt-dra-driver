@@ -8,11 +8,11 @@ the DRA API. It follows the structure and best-practices established by the
 upstream [`kubernetes-sigs/dra-example-driver`][example-driver].
 
 > [!IMPORTANT]
-> This is the initial bootstrap of the project. Only the kubelet-plugin
-> skeleton, build system, and Helm chart scaffolding are wired up. The current
-> `tenstorrent` profile publishes simulated devices so that the end-to-end
-> control-plane flow can be exercised. Real device discovery and CDI container
-> edits will be added in follow-up work.
+> This is the early bootstrap of the project. Only the kubelet-plugin
+> skeleton, build system, and Helm chart scaffolding are wired up. The
+> `tenstorrent` profile discovers ASICs by calling the Tenstorrent Fabric
+> Manager (TTFM) agent's `GetTopology` RPC on the same node; per-device CDI
+> container edits are still left to follow-up work.
 
 ## Repository layout
 
@@ -26,8 +26,9 @@ upstream [`kubernetes-sigs/dra-example-driver`][example-driver].
 ├── docker/
 │   └── Dockerfile.devel              # Builder image used for `make docker-*`
 ├── internal/
+│   ├── fabricmanager/                # Tenstorrent Fabric Manager gRPC client
 │   └── profiles/                     # Pluggable device profiles
-│       └── tenstorrent/              # Default profile (simulated devices today)
+│       └── tenstorrent/              # Default profile (TTFM-driven discovery)
 ├── pkg/
 │   └── flags/                        # Shared CLI flag groups (kubeclient, logging)
 ├── Makefile / common.mk              # Build entrypoints
@@ -92,7 +93,6 @@ ServiceAccount/ClusterRole/ClusterRoleBinding, and a `DeviceClass` named
 The following items are intentionally out of scope for this initial bootstrap
 and will be addressed in subsequent changes:
 
-* Real device discovery via `/dev/tenstorrent/*` and the Tenstorrent runtime
 * Per-device CDI container edits (device nodes, hugepages, etc.)
 * `ResourceClaim` opaque configuration (sharing modes, performance tiers, ...)
 * Validating admission webhook

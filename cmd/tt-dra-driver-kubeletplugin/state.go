@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"sync"
@@ -64,8 +65,8 @@ type DeviceState struct {
 // NewDeviceState constructs the DeviceState by enumerating devices from the
 // active profile, initializing the CDI handler and loading any previously
 // persisted checkpoint.
-func NewDeviceState(config *Config) (*DeviceState, error) {
-	driverResources, err := config.profile.EnumerateDevices()
+func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
+	driverResources, err := config.profile.EnumerateDevices(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("error enumerating all possible devices: %v", err)
 	}

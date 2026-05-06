@@ -21,6 +21,7 @@
 package profiles
 
 import (
+	"context"
 	"errors"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -59,8 +60,10 @@ func (pds PreparedDevices) GetDevices() []*drapbv1.Device {
 type Profile interface {
 	ConfigHandler
 	// EnumerateDevices returns the resource slice published into the cluster
-	// for the node the driver is running on.
-	EnumerateDevices() (resourceslice.DriverResources, error)
+	// for the node the driver is running on. Implementations may perform
+	// remote calls (e.g. to a per-node device-discovery agent) and should
+	// honour ctx for cancellation and timeouts.
+	EnumerateDevices(ctx context.Context) (resourceslice.DriverResources, error)
 }
 
 // ConfigHandler handles opaque configuration set for requests in

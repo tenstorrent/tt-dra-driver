@@ -1,0 +1,36 @@
+# Keep the Docker build context tight: only what `make cmds` actually
+# needs. In particular, third-party/ is excluded so BuildKit does not try
+# to walk the deeply-nested submodules vendored under tt-fabric-manager —
+# tt-metal's docs tree has symlinks that tar/xattr can mis-interpret as
+# "too many levels of symbolic links" and abort the build.
+
+# Local build artifacts and caches.
+.cache/
+.cache-go/
+.cache-gopath/
+dist/
+bin/
+vendor/
+/dra-tt-metal-kubeletplugin
+driver_image.tar
+*.tgz
+
+# Repo metadata not needed inside the build container.
+.git/
+.github/
+.gitignore
+.gitmodules
+
+# Editor / OS noise.
+.DS_Store
+.idea/
+.vscode/
+[._]*.sw[a-p]
+
+# Cluster-side assets not consumed by the Go build.
+deployments/helm/
+docker/
+
+# Documentation that doesn't affect the binary.
+LICENSE
+README.md

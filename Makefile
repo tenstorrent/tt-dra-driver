@@ -53,6 +53,41 @@ build:
 
 check: $(CHECK_TARGETS)
 
+##### Protobuf code generation #####
+
+# Source protos vendored from the tt-fabric-manager project.
+# TODO(p1-0tr): copy the protos into this repository so we don't need to vendor them.
+TTFM_PROTO_DIR :=
+TTFM_PROTOS := topology.proto agent.proto
+TTFM_PROTO_GO_PKG := $(MODULE)/internal/fabricmanager/proto
+
+# Regenerate the Go bindings for the fabric-manager protos consumed by the
+# DRA driver. Requires `protoc`, `protoc-gen-go` and `protoc-gen-go-grpc`
+# on PATH (e.g. `go install google.golang.org/protobuf/cmd/protoc-gen-go@latest`
+# and `go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest`).
+.PHONY: gen-proto
+gen-proto:
+	@command -v protoc >/dev/null 2>&1 || { echo "protoc not found on PATH"; exit 1; }
+	@command -v protoc-gen-go >/dev/null 2>&1 || { echo "protoc-gen-go not found on PATH"; exit 1; }
+	@command -v protoc-gen-go-grpc >/dev/null 2>&1 || { echo "protoc-gen-go-grpc not found on PATH"; exit 1; }
+	rm -rf .proto-out
+	mkdir -p .proto-out
+	protoc \
+	  --proto_path=$(TTFM_PROTO_DIR) \
+	  --go_out=.proto-out \
+	  --go_opt=module=$(MODULE) \
+	  --go_opt=Mtopology.proto=$(TTFM_PROTO_GO_PKG)/topology \
+	  --go_opt=Magent.proto=$(TTFM_PROTO_GO_PKG)/agent \
+	  --go-grpc_out=.proto-out \
+	  --go-grpc_opt=module=$(MODULE) \
+	  --go-grpc_opt=Mtopology.proto=$(TTFM_PROTO_GO_PKG)/topology \
+	  --go-grpc_opt=Magent.proto=$(TTFM_PROTO_GO_PKG)/agent \
+	  $(addprefix $(TTFM_PROTO_DIR)/,$(TTFM_PROTOS))
+	mkdir -p internal/fabricmanager/proto/topology internal/fabricmanager/proto/agent
+	cp .proto-out/internal/fabricmanager/proto/topology/*.go internal/fabricmanager/proto/topology/
+	cp .proto-out/internal/fabricmanager/proto/agent/*.go internal/fabricmanager/proto/agent/
+	rm -rf .proto-out
+
 fmt:
 	go list -f '{{.Dir}}' $(MODULE)/... \
 		| xargs gofmt -s -l -w

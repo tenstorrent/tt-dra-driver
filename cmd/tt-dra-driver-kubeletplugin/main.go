@@ -32,6 +32,7 @@ import (
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/klog/v2"
 
+	"github.com/tenstorrent/tt-dra-driver/internal/fabricmanager"
 	"github.com/tenstorrent/tt-dra-driver/internal/profiles"
 	"github.com/tenstorrent/tt-dra-driver/internal/profiles/tenstorrent"
 	"github.com/tenstorrent/tt-dra-driver/pkg/flags"
@@ -51,13 +52,13 @@ type Flags struct {
 
 	nodeName                      string
 	cdiRoot                       string
-	numDevices                    int
 	kubeletRegistrarDirectoryPath string
 	kubeletPluginsDirectoryPath   string
 	healthcheckPort               int
 	profile                       string
 	driverName                    string
 	podUID                        string
+	fabricManagerAgentAddress     string
 }
 
 // Config is the runtime configuration assembled from Flags.
@@ -66,13 +67,14 @@ type Config struct {
 	coreclient    coreclientset.Interface
 	cancelMainCtx func(error)
 
-	profile profiles.Profile
+	profile           profiles.Profile
+	fabricManagerConn *fabricmanager.AgentClient
 }
 
 // validProfiles holds the set of profile names selectable via --device-profile.
-var validProfiles = map[string]func(flags Flags) profiles.Profile{
-	tenstorrent.ProfileName: func(f Flags) profiles.Profile {
-		return tenstorrent.NewProfile(f.nodeName, f.numDevices)
+var validProfiles = map[string]func(flags Flags, agent fabricmanager.TopologyClient) profiles.Profile{
+	tenstorrent.ProfileName: func(f Flags, agent fabricmanager.TopologyClient) profiles.Profile {
+		return tenstorrent.NewProfile(f.nodeName, agent)
 	},
 }
 
@@ -126,12 +128,12 @@ func newApp() *cli.App {
 			Destination: &flags.cdiRoot,
 			EnvVars:     []string{"CDI_ROOT"},
 		},
-		&cli.IntFlag{
-			Name:        "num-devices",
-			Usage:       "Number of devices to publish. Only relevant for profiles that simulate devices.",
-			Value:       1,
-			Destination: &flags.numDevices,
-			EnvVars:     []string{"NUM_DEVICES"},
+		&cli.StringFlag{
+			Name:        "fabric-manager-agent-address",
+			Usage:       "Address (host:port) of the Tenstorrent Fabric Manager agent on this node. The kubelet plugin uses it to discover the local ASICs.",
+			Value:       "localhost:50053",
+			Destination: &flags.fabricManagerAgentAddress,
+			EnvVars:     []string{"FABRIC_MANAGER_AGENT_ADDRESS"},
 		},
 		&cli.StringFlag{
 			Name:        "kubelet-registrar-directory-path",
@@ -206,10 +208,19 @@ func newApp() *cli.App {
 				return fmt.Errorf("invalid device profile %q, valid profiles are %q", flags.profile, validProfileNames)
 			}
 
+			if flags.fabricManagerAgentAddress == "" {
+				return fmt.Errorf("--fabric-manager-agent-address must be set")
+			}
+			agentClient, err := fabricmanager.Dial(flags.fabricManagerAgentAddress)
+			if err != nil {
+				return fmt.Errorf("connect to fabric manager agent: %w", err)
+			}
+
 			config := &Config{
-				flags:      flags,
-				coreclient: clientSets.Core,
-				profile:    newProfile(*flags),
+				flags:             flags,
+				coreclient:        clientSets.Core,
+				profile:           newProfile(*flags, agentClient),
+				fabricManagerConn: agentClient,
 			}
 
 			return RunPlugin(ctx, config)
@@ -223,6 +234,14 @@ func newApp() *cli.App {
 // cancelled, e.g. via SIGINT/SIGTERM.
 func RunPlugin(ctx context.Context, config *Config) error {
 	logger := klog.FromContext(ctx)
+
+	if config.fabricManagerConn != nil {
+		defer func() {
+			if err := config.fabricManagerConn.Close(); err != nil {
+				logger.Error(err, "Unable to close fabric manager agent connection")
+			}
+		}()
+	}
 
 	if err := os.MkdirAll(config.DriverPluginPath(), 0750); err != nil {
 		return err

@@ -28,10 +28,12 @@ serviceAccount:
   name: ""
 
 kubeletPlugin:
-  # numDevices controls how many simulated devices the bootstrap
-  # `tenstorrent` profile advertises on each node. Real device discovery
-  # will replace this in a follow-up.
-  numDevices: 1
+  # fabricManagerAgentAddress is the host:port the kubelet plugin uses to
+  # talk to the per-node Tenstorrent Fabric Manager (TTFM) agent and
+  # enumerate local ASICs. The default assumes the FM agent and the DRA
+  # driver share a node-local network namespace (e.g. via hostNetwork or a
+  # node-local Service). Override per cluster as needed.
+  fabricManagerAgentAddress: "localhost:50053"
   priorityClassName: "system-node-critical"
   updateStrategy:
     type: RollingUpdate
