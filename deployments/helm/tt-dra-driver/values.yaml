@@ -30,10 +30,15 @@ serviceAccount:
 kubeletPlugin:
   # fabricManagerAgentAddress is the host:port the kubelet plugin uses to
   # talk to the per-node Tenstorrent Fabric Manager (TTFM) agent and
-  # enumerate local ASICs. The default assumes the FM agent and the DRA
-  # driver share a node-local network namespace (e.g. via hostNetwork or a
-  # node-local Service). Override per cluster as needed.
-  fabricManagerAgentAddress: "localhost:50053"
+  # enumerate local ASICs. The default targets the agent Service shipped
+  # by the upstream TTFM chart, which uses
+  # `internalTrafficPolicy: Local` so requests stay on the originating
+  # node (each kubelet plugin must talk to its own node's agent). The
+  # name is `<release>-agent.<namespace>.svc.cluster.local`; the default
+  # below assumes the chart is installed as release `ttfm` in namespace
+  # `ttfm` (matches demo/scripts/common.sh). Override per cluster as
+  # needed.
+  fabricManagerAgentAddress: "ttfm-agent.ttfm.svc.cluster.local:50053"
   priorityClassName: "system-node-critical"
   updateStrategy:
     type: RollingUpdate
