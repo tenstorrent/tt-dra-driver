@@ -19,13 +19,19 @@
 //
 // Devices are discovered via the Tenstorrent Fabric Manager (TTFM) agent
 // running on the same node: EnumerateDevices issues a GetTopology RPC and
-// converts each ASIC the agent reports into a ResourceSlice device.
+// converts each MMIO-capable ASIC the agent reports into a ResourceSlice
+// device. Non-MMIO ("remote") ASICs are not separately allocatable: they
+// have no host-visible /dev/tenstorrent/<N> entry, so they are bundled
+// into the MMIO parent on the same physical tray and travel with it
+// whenever it is allocated.
 package tenstorrent
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -69,28 +75,40 @@ const (
 	hugepages1GPath = "/dev/hugepages-1G"
 )
 
+// hostBundle represents the bundling decision for a single MMIO-capable
+// ASIC: the MMIO chip itself plus any non-MMIO ("remote") chips on the
+// same physical tray that are reachable only through it. Remote chips do
+// not appear as standalone ResourceSlice devices; their host-visible
+// character device is the MMIO parent's, so allocating the parent
+// transparently grants access to its remotes.
+type hostBundle struct {
+	mmio    *topologypb.AsicInfo
+	remotes []*topologypb.AsicInfo
+}
+
 // Profile is the Tenstorrent device profile.
 //
-// EnumerateDevices populates an internal map from ResourceSlice device name
-// to the AsicInfo that produced it; ApplyConfig consults that map to build
-// per-device CDI container edits (e.g. /dev/tenstorrent/<chipID>).
+// EnumerateDevices populates an internal map from ResourceSlice device
+// name to the hostBundle that produced it; ApplyConfig consults that map
+// to build per-device CDI container edits (e.g. /dev/tenstorrent/<chipID>
+// for the bundle's MMIO parent).
 type Profile struct {
 	nodeName string
 	topology fabricmanager.TopologyClient
 
-	mu           sync.RWMutex
-	asicByDevice map[string]*topologypb.AsicInfo
+	mu             sync.RWMutex
+	bundleByDevice map[string]hostBundle
 }
 
 // NewProfile constructs a Tenstorrent profile that publishes one
-// ResourceSlice device per ASIC reported by the fabric manager agent on the
-// given node. The topology client must be non-nil; pass a *fabricmanager.AgentClient
-// in production and a fake in tests.
+// ResourceSlice device per MMIO-capable ASIC reported by the fabric
+// manager agent on the given node. The topology client must be non-nil;
+// pass a *fabricmanager.AgentClient in production and a fake in tests.
 func NewProfile(nodeName string, topology fabricmanager.TopologyClient) *Profile {
 	return &Profile{
-		nodeName:     nodeName,
-		topology:     topology,
-		asicByDevice: make(map[string]*topologypb.AsicInfo),
+		nodeName:       nodeName,
+		topology:       topology,
+		bundleByDevice: make(map[string]hostBundle),
 	}
 }
 
@@ -105,17 +123,19 @@ func (p *Profile) EnumerateDevices(ctx context.Context) (resourceslice.DriverRes
 		return resourceslice.DriverResources{}, fmt.Errorf("tenstorrent profile: get topology from fabric manager agent: %w", err)
 	}
 
-	asics := hostTopology.GetAsics()
-	devices := make([]resourceapi.Device, 0, len(asics))
-	asicByDevice := make(map[string]*topologypb.AsicInfo, len(asics))
-	for _, asic := range asics {
-		device := asicToDevice(asic)
+	logger := klog.FromContext(ctx)
+	bundles := bundleHostASICs(hostTopology.GetAsics(), logger)
+
+	devices := make([]resourceapi.Device, 0, len(bundles))
+	bundleByDevice := make(map[string]hostBundle, len(bundles))
+	for _, bundle := range bundles {
+		device := bundleToDevice(bundle)
 		devices = append(devices, device)
-		asicByDevice[device.Name] = asic
+		bundleByDevice[device.Name] = bundle
 	}
 
 	p.mu.Lock()
-	p.asicByDevice = asicByDevice
+	p.bundleByDevice = bundleByDevice
 	p.mu.Unlock()
 
 	return resourceslice.DriverResources{
@@ -176,43 +196,36 @@ func (p *Profile) Validate(config runtime.Object) error {
 // ApplyConfig implements profiles.ConfigHandler.
 //
 // It produces per-device CDI container edits that expose
-// /dev/tenstorrent/<chipID> to the workload for every MMIO-capable ASIC in
-// the allocation. Non-MMIO (remote) ASICs do not have their own character
-// device on the host; for those a warning is logged and no DeviceNode is
-// emitted (multi-chip allocation is handled in a follow-up step).
+// /dev/tenstorrent/<chipID> to the workload for every allocated device.
+// Because EnumerateDevices only ever publishes MMIO-capable ASICs (with
+// any non-MMIO siblings bundled in), every entry in results corresponds
+// to exactly one host-visible character device.
 func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.DeviceRequestAllocationResult) (profiles.PerDeviceCDIContainerEdits, error) {
 	if config != nil {
 		return nil, errors.New("tenstorrent profile: opaque configuration is not supported yet")
 	}
-
-	logger := klog.Background()
 
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	edits := make(profiles.PerDeviceCDIContainerEdits, len(results))
 	for _, result := range results {
-		asic, ok := p.asicByDevice[result.Device]
+		bundle, ok := p.bundleByDevice[result.Device]
 		if !ok {
 			return nil, fmt.Errorf("tenstorrent profile: device %q is not in the latest enumeration", result.Device)
 		}
-		if !asic.GetIsMmioCapable() {
-			// Remote chips have no /dev/tenstorrent/<N> entry; until we
-			// model multi-chip claims explicitly, leave them with no
-			// device-node edits and let later steps decide how to expose
-			// them.
-			logger.V(2).Info("Skipping CDI device-node edit for non-MMIO Tenstorrent chip",
-				"device", result.Device,
-				"chipID", asic.GetChipId(),
-				"trayID", asic.GetTrayId(),
-			)
-			continue
+		// Defensive: EnumerateDevices is responsible for filtering
+		// non-MMIO chips out of the ResourceSlice. If one ever leaks
+		// through, fail loudly rather than silently producing a CDI spec
+		// with no device node.
+		if !bundle.mmio.GetIsMmioCapable() {
+			return nil, fmt.Errorf("tenstorrent profile: device %q resolves to a non-MMIO ASIC, which should never appear in the ResourceSlice", result.Device)
 		}
 		edits[result.Device] = &cdiapi.ContainerEdits{
 			ContainerEdits: &cdispec.ContainerEdits{
 				DeviceNodes: []*cdispec.DeviceNode{
 					{
-						Path:        fmt.Sprintf(devicePathFmt, asic.GetChipId()),
+						Path:        fmt.Sprintf(devicePathFmt, bundle.mmio.GetChipId()),
 						Type:        "c",
 						Permissions: "rw",
 					},
@@ -223,54 +236,152 @@ func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devi
 	return edits, nil
 }
 
-// asicToDevice converts a fabric-manager AsicInfo into a ResourceSlice
-// device. The device name uses the host-local chip id so it is stable across
-// agent restarts on the same host.
-func asicToDevice(asic *topologypb.AsicInfo) resourceapi.Device {
+// bundleHostASICs partitions a host's ASICs into one hostBundle per
+// MMIO-capable chip. Non-MMIO chips are attached to the MMIO chip with
+// the lowest asic_location on their tray; any additional MMIO chip on the
+// same tray becomes a standalone bundle (no remotes). ASICs on trays
+// without any MMIO chip are dropped with a warning, since no host-visible
+// device exists through which they could be opened.
+//
+// Bundles are returned in ascending chip-id order so that the resulting
+// ResourceSlice has stable, deterministic ordering across calls.
+func bundleHostASICs(asics []*topologypb.AsicInfo, logger klog.Logger) []hostBundle {
+	byTray := make(map[uint32][]*topologypb.AsicInfo)
+	for _, asic := range asics {
+		byTray[asic.GetTrayId()] = append(byTray[asic.GetTrayId()], asic)
+	}
+
+	var bundles []hostBundle
+	for trayID, group := range byTray {
+		mmio, remote := splitByMmio(group)
+		if len(mmio) == 0 {
+			logger.Info("Skipping Tenstorrent ASICs on tray with no MMIO peer; they cannot be opened from a container",
+				"trayID", trayID,
+				"chipIDs", chipIDsOf(remote),
+			)
+			continue
+		}
+		sort.Slice(mmio, func(i, j int) bool {
+			return mmio[i].GetAsicLocation() < mmio[j].GetAsicLocation()
+		})
+		// The lowest-asic_location MMIO chip on the tray adopts every
+		// remote chip on that tray; any additional MMIO chips become
+		// standalone bundles.
+		bundles = append(bundles, hostBundle{mmio: mmio[0], remotes: remote})
+		for _, extra := range mmio[1:] {
+			bundles = append(bundles, hostBundle{mmio: extra})
+		}
+	}
+
+	sort.Slice(bundles, func(i, j int) bool {
+		return bundles[i].mmio.GetChipId() < bundles[j].mmio.GetChipId()
+	})
+	return bundles
+}
+
+// splitByMmio partitions a list of ASICs into MMIO-capable and non-MMIO
+// (remote) subsets, preserving relative order within each.
+func splitByMmio(asics []*topologypb.AsicInfo) (mmio, remote []*topologypb.AsicInfo) {
+	for _, asic := range asics {
+		if asic.GetIsMmioCapable() {
+			mmio = append(mmio, asic)
+		} else {
+			remote = append(remote, asic)
+		}
+	}
+	return mmio, remote
+}
+
+// chipIDsOf extracts host-local chip ids from an ASIC list, used purely
+// for human-readable log output.
+func chipIDsOf(asics []*topologypb.AsicInfo) []uint32 {
+	ids := make([]uint32, 0, len(asics))
+	for _, a := range asics {
+		ids = append(ids, a.GetChipId())
+	}
+	return ids
+}
+
+// bundleToDevice converts a hostBundle into a ResourceSlice device. The
+// device name uses the MMIO parent's host-local chip id so it is stable
+// across agent restarts on the same host.
+func bundleToDevice(bundle hostBundle) resourceapi.Device {
+	mmio := bundle.mmio
 	device := resourceapi.Device{
-		Name: deviceNameForChip(asic.GetChipId()),
+		Name: deviceNameForChip(mmio.GetChipId()),
 		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 			"vendor": {
 				StringValue: ptr.To(Vendor),
 			},
 			"chipID": {
-				IntValue: ptr.To(int64(asic.GetChipId())),
+				IntValue: ptr.To(int64(mmio.GetChipId())),
 			},
 			"trayID": {
-				IntValue: ptr.To(int64(asic.GetTrayId())),
+				IntValue: ptr.To(int64(mmio.GetTrayId())),
 			},
 			"asicLocation": {
-				IntValue: ptr.To(int64(asic.GetAsicLocation())),
+				IntValue: ptr.To(int64(mmio.GetAsicLocation())),
 			},
 			"boardType": {
-				IntValue: ptr.To(int64(asic.GetBoardType())),
+				IntValue: ptr.To(int64(mmio.GetBoardType())),
 			},
 			"chipArch": {
-				StringValue: ptr.To(asic.GetChipArch()),
+				StringValue: ptr.To(mmio.GetChipArch()),
 			},
 			// uniqueID is uint64 in the proto; render it as a string to
 			// avoid losing the high bit when squeezing it into int64.
 			"uniqueID": {
-				StringValue: ptr.To(fmt.Sprintf("%d", asic.GetUniqueId())),
+				StringValue: ptr.To(fmt.Sprintf("%d", mmio.GetUniqueId())),
 			},
-			"isMmioCapable": {
-				BoolValue: ptr.To(asic.GetIsMmioCapable()),
+			// chipCount is the total number of chips a workload gets when
+			// it is allocated this device: the MMIO parent plus any
+			// bundled non-MMIO siblings on the same tray. Schedulers can
+			// match on it to e.g. require "an N300" (chipCount == 2).
+			"chipCount": {
+				IntValue: ptr.To(int64(1 + len(bundle.remotes))),
 			},
 		},
 	}
-	if pci := asic.GetPciAddress(); pci != "" {
+	if pci := mmio.GetPciAddress(); pci != "" {
 		device.Attributes["pciAddress"] = resourceapi.DeviceAttribute{
 			StringValue: ptr.To(pci),
 		}
 	}
-	if mem := asic.GetMemoryBytes(); mem > 0 {
+	if len(bundle.remotes) > 0 {
+		chipIDs := make([]string, 0, len(bundle.remotes))
+		uniqueIDs := make([]string, 0, len(bundle.remotes))
+		for _, r := range bundle.remotes {
+			chipIDs = append(chipIDs, fmt.Sprintf("%d", r.GetChipId()))
+			uniqueIDs = append(uniqueIDs, fmt.Sprintf("%d", r.GetUniqueId()))
+		}
+		device.Attributes["remoteChipIDs"] = resourceapi.DeviceAttribute{
+			StringValue: ptr.To(strings.Join(chipIDs, ",")),
+		}
+		device.Attributes["remoteUniqueIDs"] = resourceapi.DeviceAttribute{
+			StringValue: ptr.To(strings.Join(uniqueIDs, ",")),
+		}
+	}
+	if total := totalMemoryBytes(bundle); total > 0 {
 		device.Capacity = map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
 			"memory": {
-				Value: *resource.NewQuantity(int64(mem), resource.BinarySI),
+				Value: *resource.NewQuantity(int64(total), resource.BinarySI),
 			},
 		}
 	}
 	return device
+}
+
+// totalMemoryBytes returns the aggregate DRAM advertised by every ASIC in
+// the bundle. Reporting the bundled total (rather than just the MMIO
+// chip's memory) lets schedulers express memory requests in terms of the
+// physically usable memory the workload will see when allocated this
+// device.
+func totalMemoryBytes(bundle hostBundle) uint64 {
+	total := bundle.mmio.GetMemoryBytes()
+	for _, r := range bundle.remotes {
+		total += r.GetMemoryBytes()
+	}
+	return total
 }
 
 // deviceNameForChip returns the canonical ResourceSlice device name used
