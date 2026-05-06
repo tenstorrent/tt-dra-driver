@@ -77,9 +77,10 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        # Number of devices the bootstrap profile will simulate.
-        - name: NUM_DEVICES
-          value: {{ .Values.kubeletPlugin.numDevices | quote }}
+        # Address (host:port) of the per-node Tenstorrent Fabric Manager
+        # agent. The kubelet plugin uses it to discover the local ASICs.
+        - name: FABRIC_MANAGER_AGENT_ADDRESS
+          value: {{ .Values.kubeletPlugin.fabricManagerAgentAddress | quote }}
         {{- if .Values.kubeletPlugin.containers.plugin.healthcheckPort }}
         - name: HEALTHCHECK_PORT
           value: {{ .Values.kubeletPlugin.containers.plugin.healthcheckPort | quote }}

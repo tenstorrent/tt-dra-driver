@@ -49,7 +49,7 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		cancelCtx: config.cancelMainCtx,
 	}
 
-	state, err := NewDeviceState(config)
+	state, err := NewDeviceState(ctx, config)
 	if err != nil {
 		return nil, err
 	}
