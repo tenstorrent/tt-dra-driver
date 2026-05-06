@@ -64,6 +64,16 @@ type Profile interface {
 	// remote calls (e.g. to a per-node device-discovery agent) and should
 	// honour ctx for cancellation and timeouts.
 	EnumerateDevices(ctx context.Context) (resourceslice.DriverResources, error)
+	// CommonContainerEdits returns CDI container edits that must be applied
+	// to every container that consumes a device managed by this profile,
+	// independent of which specific devices were allocated. Returning nil
+	// means no node-wide edits are required.
+	//
+	// These edits are written into the per-driver "common" CDI device that
+	// the kubelet plugin prepends to every claim, so a typical use is to
+	// declare host bind mounts (e.g. hugepages) or env vars that the
+	// runtime needs regardless of the chip selection.
+	CommonContainerEdits() *cdiapi.ContainerEdits
 }
 
 // ConfigHandler handles opaque configuration set for requests in

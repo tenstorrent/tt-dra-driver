@@ -36,14 +36,18 @@ var nonWord = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
 // CDIHandler manages the on-disk CDI specs published by the driver.
 type CDIHandler struct {
-	cache      *cdiapi.Cache
-	driverName string
-	class      string
+	cache       *cdiapi.Cache
+	driverName  string
+	class       string
+	commonEdits *cdiapi.ContainerEdits
 }
 
 // NewCDIHandler returns a CDIHandler that writes its specs into the given
-// root directory.
-func NewCDIHandler(root string, driverName, class string) (*CDIHandler, error) {
+// root directory. The optional commonEdits, when non-nil, are merged into
+// the per-driver "common" CDI device that the kubelet plugin prepends to
+// every claim; a typical use is to declare node-wide bind mounts (e.g.
+// hugepages) that every workload using a managed device requires.
+func NewCDIHandler(root, driverName, class string, commonEdits *cdiapi.ContainerEdits) (*CDIHandler, error) {
 	cache, err := cdiapi.NewCache(
 		cdiapi.WithSpecDirs(root),
 	)
@@ -51,27 +55,33 @@ func NewCDIHandler(root string, driverName, class string) (*CDIHandler, error) {
 		return nil, fmt.Errorf("unable to create a new CDI cache: %w", err)
 	}
 	return &CDIHandler{
-		cache:      cache,
-		driverName: driverName,
-		class:      class,
+		cache:       cache,
+		driverName:  driverName,
+		class:       class,
+		commonEdits: commonEdits,
 	}, nil
 }
 
 // CreateCommonSpecFile writes the per-driver "common" CDI spec that injects
-// node-wide environment variables into every container that consumes a
-// device.
+// node-wide environment variables and any profile-supplied container edits
+// (e.g. hugepage mounts) into every container that consumes a device.
 func (cdi *CDIHandler) CreateCommonSpecFile() error {
+	commonEdits := cdiapi.ContainerEdits{
+		ContainerEdits: &cdispec.ContainerEdits{
+			Env: []string{
+				fmt.Sprintf("KUBERNETES_NODE_NAME=%s", os.Getenv("NODE_NAME")),
+				fmt.Sprintf("DRA_RESOURCE_DRIVER_NAME=%s", cdi.driverName),
+			},
+		},
+	}
+	commonEdits.Append(cdi.commonEdits)
+
 	spec := &cdispec.Spec{
 		Kind: cdi.kind(),
 		Devices: []cdispec.Device{
 			{
-				Name: cdiCommonDeviceName,
-				ContainerEdits: cdispec.ContainerEdits{
-					Env: []string{
-						fmt.Sprintf("KUBERNETES_NODE_NAME=%s", os.Getenv("NODE_NAME")),
-						fmt.Sprintf("DRA_RESOURCE_DRIVER_NAME=%s", cdi.driverName),
-					},
-				},
+				Name:           cdiCommonDeviceName,
+				ContainerEdits: *commonEdits.ContainerEdits,
 			},
 		},
 	}
