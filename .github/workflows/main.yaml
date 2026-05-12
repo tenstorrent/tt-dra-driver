@@ -46,6 +46,10 @@ jobs:
     uses: ./.github/workflows/push-helm.yml
     secrets: inherit
     needs: build-image
+    with:
+      version: ${{ needs.semver.outputs.version }}
+      context: helm/tt-dra-driver
+      chart: tt-dra-driver
     permissions:
       contents: read
       packages: write
