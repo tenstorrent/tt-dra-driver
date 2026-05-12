@@ -16,7 +16,7 @@ upstream [`kubernetes-sigs/dra-example-driver`][example-driver].
 
 ## Architecture
 
-DRA Plugin daemonset connects to Fabric Manager Agent's local discovery endpoint to enumarae and register ResourceSlices.
+DRA Plugin daemonset connects to Fabric Manager Agent's local discovery endpoint to enumarate and register ResourceSlices.
 
 ![alt text](img/dra-diagram.png)
 
