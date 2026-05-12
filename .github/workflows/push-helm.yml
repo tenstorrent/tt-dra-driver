@@ -2,20 +2,19 @@ name: Build and push Helm Chart
 
 on:
   workflow_call:
-
-inputs:
-  version:
-    description: "The version of the chart"
-    required: true
-    type: string
-  context:
-    description: "The build context"
-    required: true
-    type: string
-  chart:
-    description: "The chart to build"
-    required: true
-    type: string
+    inputs:
+      version:
+        description: "The version of the chart"
+        required: true
+        type: string
+      context:
+        description: "The build context"
+        required: true
+        type: string
+      chart:
+        description: "The chart to build"
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
