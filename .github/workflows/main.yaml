@@ -37,7 +37,7 @@ jobs:
       version: ${{ needs.semver.outputs.version }}
       images: ghcr.io/${{ github.repository }}
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile 
     secrets: inherit
     permissions:
       contents: read
@@ -47,7 +47,7 @@ jobs:
     name: Helm Chart
     uses: ./.github/workflows/push-helm.yml
     secrets: inherit
-    needs: build-image
+    needs: [semver, build-image]
     with:
       version: ${{ needs.semver.outputs.version }}
       context: helm/tt-dra-driver
