@@ -15,7 +15,9 @@ deviceProfile: "tenstorrent"
 # its value is derived from the deviceProfile.
 driverName: ""
 
-imagePullSecrets: []
+imagePullSecrets:
+  - name: tt-dra-driver
+
 image:
   repository: ghcr.io/tenstorrent/tt-dra-driver
   pullPolicy: IfNotPresent
@@ -47,7 +49,8 @@ kubeletPlugin:
       maxUnavailable: 0
   podAnnotations: {}
   podSecurityContext: {}
-  nodeSelector: {}
+  nodeSelector:
+    tenstorrent.com/has-tt: "true"
   tolerations: []
   affinity: {}
   kubeletRegistrarDirectoryPath: /var/lib/kubelet/plugins_registry
