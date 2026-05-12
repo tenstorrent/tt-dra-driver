@@ -14,6 +14,12 @@ upstream [`kubernetes-sigs/dra-example-driver`][example-driver].
 > Manager (TTFM) agent's `GetTopology` RPC on the same node; per-device CDI
 > container edits are still left to follow-up work.
 
+## Architecture
+
+DRA Plugin daemonset connects to Fabric Manager Agent's local discovery endpoint to enumarae and register ResourceSlices.
+
+![alt text](img/dra-diagram.png)
+
 ## Repository layout
 
 ```
