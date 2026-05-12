@@ -43,4 +43,4 @@ jobs:
           sed -i "s/0.0.0-dev/${{ inputs.version }}/g" Chart.yaml
           sed -i "s/latest/${{ inputs.version }}/g" Chart.yaml
           helm package .
-          helm push ${{ inputs.chart }}-${{ inputs.version }}.tgz oci://ghcr.io/tenstorrent/helm/${{ inputs.chart }}
+          helm push ${{ inputs.chart }}-${{ inputs.version }}.tgz oci://ghcr.io/tenstorrent/helm/
