@@ -20,19 +20,32 @@ upstream [`kubernetes-sigs/dra-example-driver`][example-driver].
 .
 ├── cmd/
 │   └── tt-dra-driver-kubeletplugin/   # Kubelet plugin entrypoint and main loop
-├── deployments/
-│   ├── container/                    # Production Dockerfile + helper Makefile
-│   └── helm/tt-dra-driver/     # Helm chart for cluster-side install
+│       ├── main.go, driver.go, ...
+├── deployment/
+│   ├── flux.yaml                      # Flux deployment manifest
 ├── docker/
-│   └── Dockerfile.devel              # Builder image used for `make docker-*`
+│   ├── Dockerfile                     # Production Dockerfile
+│   ├── Dockerfile.devel               # Dev/builder image for `make docker-*`
+│   └── Makefile                       # Helper Makefile for docker builds
+├── helm/
+│   └── tt-dra-driver/
+│       ├── Chart.yaml, values.yaml    # Helm chart for cluster-side install
+│       └── templates/                 # Helm templates (RBAC, DaemonSet, etc.)
 ├── internal/
-│   ├── fabricmanager/                # Tenstorrent Fabric Manager gRPC client
-│   └── profiles/                     # Pluggable device profiles
-│       └── tenstorrent/              # Default profile (TTFM-driven discovery)
+│   ├── fabricmanager/                 # Tenstorrent Fabric Manager gRPC client
+│   │   ├── client.go
+│   │   └── proto/
+│   │       ├── agent/agent.pb.go, ...
+│   │       └── topology/topology.pb.go
+│   └── profiles/                      # Pluggable device profiles
+│       ├── profiles.go
+│       └── tenstorrent/tenstorrent.go # Default profile (TTFM-driven discovery)
 ├── pkg/
-│   └── flags/                        # Shared CLI flag groups (kubeclient, logging)
-├── Makefile / common.mk              # Build entrypoints
-├── go.mod                            # Module definition
+│   └── flags/                         # Shared CLI flag groups (kubeclient, logging)
+│       ├── kubeclient.go
+│       └── logging.go
+├── Makefile / common.mk               # Build entrypoints
+├── go.mod, go.sum                     # Module definition and deps
 └── README.md
 ```
 

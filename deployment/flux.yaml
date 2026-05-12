@@ -1,0 +1,39 @@
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmRepository
+metadata:
+  name: tt-dra-driver
+  namespace: tt-dra-driver
+spec:
+  type: "oci"
+  interval: 10m
+  url: oci://ghcr.io/tenstorrent/helm
+  secretRef:
+    name: tt-dra-driver
+
+---
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: HelmChart
+metadata:
+  name: tt-dra-driver
+  namespace: tt-dra-driver
+spec:
+  interval: 5m
+  chart: tt-dra-driver
+  sourceRef:
+    kind: HelmRepository
+    name: tt-dra-driver
+  version: " >= 0.0.0"
+
+---
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: tt-dra-driver
+  namespace: tt-dra-driver
+spec:
+  interval: 24h
+  chartRef:
+    kind: HelmChart
+    name: tt-dra-driver
+    namespace: tt-dra-driver
