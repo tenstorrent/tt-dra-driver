@@ -11,6 +11,6 @@ version: 0.0.0-dev
 
 # This is the version of the application packaged by this chart. It should
 # track the appVersion of the released container image.
-appVersion: "v0.0.0-dev"
+appVersion: "latest"
 
 kubeVersion: ">=1.33.0-0"
