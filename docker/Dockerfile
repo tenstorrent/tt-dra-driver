@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-ARG GOLANG_VERSION=undefined
-ARG BASE_IMAGE=undefined
+ARG GOLANG_VERSION=1.26.3
+ARG BASE_IMAGE=ubuntu:24.04
 FROM golang:${GOLANG_VERSION} AS build
 
 WORKDIR /build
@@ -35,3 +35,4 @@ LABEL summary="DRA resource driver for Tenstorrent accelerators"
 LABEL description="See summary"
 
 COPY --from=build /artifacts/tt-dra-driver-kubeletplugin /usr/bin/tt-dra-driver-kubeletplugin
+CMD [ "tt-dra-driver-kubeletplugin" ]

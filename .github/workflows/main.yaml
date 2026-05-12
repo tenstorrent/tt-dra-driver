@@ -1,0 +1,51 @@
+name: DRA Driver 
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  semver:
+    name: SemVer
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.semver.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - name: Determine version
+        id: semver
+        uses: paulhatch/semantic-version@v5.4.0
+        with:
+          tag_prefix: ""
+          version_format: "${major}.${minor}.${patch}"
+          bump_each_commit: true
+          version_from_branch: true
+          enable_prerelease_mode: false
+
+  build-image:
+    name: Container
+    needs: [semver]
+    uses: ./.github/workflows/push-docker.yml
+    with:
+      version: ${{ needs.semver.outputs.version }}
+      images: ghcr.io/${{ github.repository }}/tt-pvc-injector
+    secrets: inherit
+    permissions:
+      contents: read
+      packages: write
+
+  build-chart:
+    name: Helm Chart
+    uses: ./.github/workflows/push-helm.yml
+    secrets: inherit
+    needs: build-image
+    permissions:
+      contents: read
+      packages: write
