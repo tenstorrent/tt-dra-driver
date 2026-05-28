@@ -20,6 +20,45 @@ DRA Plugin daemonset connects to Fabric Manager Agent's local discovery endpoint
 
 ![alt text](img/dra-diagram.png)
 
+## Usage example
+Create ResourceClaim targeting specific device by unique ID, for example:
+```
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: onechip
+spec:
+  devices:
+    requests:
+      - name: chip
+        exactly:
+          deviceClassName: tenstorrent.com
+          selectors:
+            - cel:
+                expression: 'device.attributes["tenstorrent.com"].uniqueID == "18080982798508798832"'
+```
+
+Create Pod with tt-metal upstream container targeting the resource claim:
+```
+apiVersion: v1
+kind: Pod
+metadata:
+  name: onechip-pod
+spec:
+  containers:
+    - name: ctr
+      image: ghcr.io/tenstorrent/tt-metal/upstream-tests-bh:v0.72.0-dev20260519-42-gee154fec28d
+      command: ["sleep", "infinity"]
+      resources:
+        claims:
+          - name: onechip
+  resourceClaims:
+    - name: onechip
+      resourceClaimName: onechip
+```
+
+
 ## Repository layout
 
 ```
