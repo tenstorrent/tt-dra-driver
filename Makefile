@@ -55,9 +55,9 @@ check: $(CHECK_TARGETS)
 
 ##### Protobuf code generation #####
 
-# Source protos vendored from the tt-fabric-manager project.
-# TODO(p1-0tr): copy the protos into this repository so we don't need to vendor them.
-TTFM_PROTO_DIR :=
+# Source protos copied from the tt-fabric-manager project. Keep these in sync
+# with upstream and regenerate the Go bindings with `make gen-proto`.
+TTFM_PROTO_DIR := $(CURDIR)/fm-proto
 TTFM_PROTOS := topology.proto agent.proto
 TTFM_PROTO_GO_PKG := $(MODULE)/internal/fabricmanager/proto
 

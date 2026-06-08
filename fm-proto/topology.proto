@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package fabricmanager.topology;
+
+// Shared physical-topology types used by the daemon service (during
+// registration and heartbeats) and the agent service (as the payload of a
+// RediscoverTopology response). Kept in a standalone package so that neither
+// service has to depend on the other's schema just to reuse these messages.
+
+// Physical topology for a single host (subset of PhysicalSystemDescriptor).
+message HostPhysicalTopology {
+  // All ASICs discovered on this host.
+  repeated AsicInfo asics = 1;
+
+  // Intra-host ethernet connections (between ASICs on this host).
+  repeated LocalEthConnection local_connections = 2;
+
+  // Exit node connections (to ASICs on other hosts).
+  repeated ExitNodeInfo exit_nodes = 3;
+}
+
+// Information about a single ASIC.
+message AsicInfo {
+  uint64 unique_id = 1;         // Globally unique ASIC ID
+  uint32 board_type = 2;        // tt::BoardType enum value
+  uint32 tray_id = 3;           // Physical tray identifier
+  uint32 asic_location = 4;     // Position within tray/board
+  string chip_arch = 5;         // Architecture string (e.g., "wormhole_b0")
+  uint64 memory_bytes = 6;      // Total DRAM in bytes
+  string pci_address = 7;       // PCI BDF address (only set for MMIO capable chips)
+  uint32 chip_id = 8;           // Logical chip id within the host
+  bool is_mmio_capable = 9;     // Is the chip capable of addressing host memory
+  uint32 device_node_id = 10;   // Device node identifier (the N in /dev/tenstorrent/N)
+  string device_node_path = 11; // Device node path (e.g. /dev/tenstorrent/1)
+}
+
+// Local ethernet connection (between ASICs on same host).
+message LocalEthConnection {
+  uint64 src_asic_id = 1;
+  uint32 src_channel = 2;
+  uint64 dst_asic_id = 3;
+  uint32 dst_channel = 4;
+}
+
+// Exit node connection (to ASIC on remote host).
+message ExitNodeInfo {
+  uint64 local_asic_id = 1;     // ASIC on this host
+  uint32 local_channel = 2;     // Ethernet channel on local ASIC
+  uint64 remote_asic_id = 3;    // ASIC unique ID on remote host
+  uint32 remote_channel = 4;    // Ethernet channel on remote ASIC
+}
