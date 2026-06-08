@@ -61,9 +61,10 @@ const DefaultDriverName = "tenstorrent.com"
 const Vendor = "tenstorrent"
 
 // devicePathFmt is the path of the per-ASIC character device created by the
-// Tenstorrent KMD. The "%d" is the host-local chip id reported by the
-// fabric-manager agent (also the integer suffix on the corresponding
-// ResourceSlice device name).
+// Tenstorrent KMD. The "%d" is the device node id reported by the
+// fabric-manager agent (the N in /dev/tenstorrent/N), which is the
+// authoritative mapping between an ASIC and its host-visible character
+// device.
 const devicePathFmt = "/dev/tenstorrent/%d"
 
 // Hugepage mount points. Every UMD-based runtime (tt-metal, tt-train,
@@ -225,7 +226,7 @@ func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devi
 			ContainerEdits: &cdispec.ContainerEdits{
 				DeviceNodes: []*cdispec.DeviceNode{
 					{
-						Path:        fmt.Sprintf(devicePathFmt, bundle.mmio.GetChipId()),
+						Path:        fmt.Sprintf(devicePathFmt, bundle.mmio.GetDeviceNodeId()),
 						Type:        "c",
 						Permissions: "rw",
 					},
