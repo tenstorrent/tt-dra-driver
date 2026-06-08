@@ -1,0 +1,212 @@
+syntax = "proto3";
+
+package fabricmanager.agent;
+
+import "topology.proto";
+
+// AgentService is hosted by each agent (daemon) and exposes actions the
+// controller may invoke on the agent. The service shares a port with the
+// standard gRPC health checking service registered by the agent process.
+//
+// This is the service that carries agent-directed control plane actions such
+// as triggering local topology rediscovery.
+service AgentService {
+    // Simple reachability test. The agent echoes back the request's message.
+    rpc Ping (PingRequest) returns (PingResponse) {}
+
+    // Re-run local topology discovery and return the fresh state. The call is
+    // synchronous: on OK/FALLBACK the response carries the new
+    // HostPhysicalTopology and cluster descriptor YAML. The agent serialises
+    // rediscoveries and rejects concurrent ones with ALREADY_IN_PROGRESS so
+    // that UMD is never invoked from two threads simultaneously.
+    rpc RediscoverTopology (RediscoverTopologyRequest) returns (RediscoverTopologyResponse) {}
+
+    rpc GetTopology (GetTopologyRequest) returns (GetTopologyResponse) {}
+
+    // Re-train (re-initialise) one or more ethernet links on this host. The
+    // agent dispatches each link to the tt-ethtool library, which:
+    //   * On Wormhole, writes the SerDes-retrain trigger via the ETH FW
+    //     mailbox (ETH_RETRAIN_ADDR). The Blackhole reinit fields on the
+    //     per-link request are ignored.
+    //   * On Blackhole, sends ETH_MSG_PORT_REINIT_MACPCS with the FW retry
+    //     budget and reinit option supplied per-link (defaults are applied
+    //     when the fields are zero).
+    //
+    // The call is synchronous: it returns once every link has been processed.
+    // The agent uses two-phase semantics within the batch — it *fires* the
+    // reinit/retrain on every link first and only then *waits* for each to
+    // complete. This is required by the ETH FW, which only finishes a reinit
+    // once the link's peer is also reiniting: the two ends of an intra-host
+    // link therefore arrive in one request and must both be kicked off within
+    // a few seconds of each other rather than serially. (Cross-host links have
+    // their two ends driven by the controller as parallel RPCs to each host.)
+    // The response carries one LinkRetrainResult per request entry (in the
+    // same order) plus a top-level summary status: OK / PARTIAL / FAILED
+    // depending on how many per-link results succeeded.
+    rpc RetrainLinks (RetrainLinksRequest) returns (RetrainLinksResponse) {}
+}
+
+message PingRequest {
+    string message = 1;
+}
+
+message PingResponse {
+    string message = 1;
+}
+
+message RediscoverTopologyRequest {
+    // Reserved for future expansion (e.g. force, deadline_ms). Kept empty for
+    // now so that the schema is forward-compatible.
+}
+
+// Outcome of a RediscoverTopology call. Kept in the agent package because it
+// describes agent-local behaviour; the controller maps it to its own
+// user-facing status in orchestrator.proto.
+enum RediscoverStatus {
+    REDISCOVER_UNKNOWN = 0;
+    // UMD topology discovery ran successfully; physical_topology and
+    // cluster_descriptor_yaml are populated from the fresh cluster descriptor.
+    REDISCOVER_OK = 1;
+    // UMD discovery failed; the response carries a best-effort fallback
+    // topology (scanned from /dev/tenstorrent/*) and no cluster descriptor.
+    // The controller may choose to accept or reject this.
+    REDISCOVER_FALLBACK = 2;
+    // Another rediscovery is already in flight on this agent. No state was
+    // mutated; the caller may retry.
+    REDISCOVER_ALREADY_IN_PROGRESS = 3;
+    // Rediscovery threw an unexpected error. physical_topology is not
+    // populated; message carries a human-readable reason.
+    REDISCOVER_FAILED = 4;
+}
+
+message RediscoverTopologyResponse {
+    RediscoverStatus status = 1;
+    // Human-readable detail: success counts, failure reason, or the reason a
+    // rediscovery was rejected.
+    string message = 2;
+    // Present when status is REDISCOVER_OK or REDISCOVER_FALLBACK.
+    fabricmanager.topology.HostPhysicalTopology physical_topology = 3;
+    // Present when status is REDISCOVER_OK (UMD path); empty on the fallback
+    // path because there is no cluster descriptor to serialise.
+    string cluster_descriptor_yaml = 4;
+}
+
+message GetTopologyRequest {}
+
+enum GetTopologyStatus {
+    TOPOLOGY_OK = 0;
+    TOPOLOGY_NOT_DISCOVERED = 1;
+}
+
+message GetTopologyResponse {
+    GetTopologyStatus status = 1;
+    fabricmanager.topology.HostPhysicalTopology physical_topology = 2;
+    string cluster_descriptor_yaml = 3;
+}
+
+// Identifies a single link to retrain plus the architecture-specific
+// tunables honoured by the FW. Wormhole has no tunables today; the
+// blackhole_* fields are ignored on Wormhole chips.
+message LinkRetrainRequest {
+    // Logical chip id within the host (matches HostPhysicalTopology.Asic.chip_id
+    // and the chip_id reported by tt-ethtool list).
+    uint32 chip_id = 1;
+
+    // Ethernet channel index on that chip.
+    uint32 channel = 2;
+
+    // Blackhole-only. Selects the reinit flavour for ETH_MSG_PORT_REINIT_MACPCS:
+    //   0 = MAC only (SERDES already trained)
+    //   1 = MAC + SERDES retrain
+    //   2 = MAC + SERDES from reset (default when this field is zero)
+    //   3 = MAC + SERDES from reset + TX barrier
+    // Ignored on Wormhole.
+    uint32 blackhole_reinit_option = 3;
+
+    // Blackhole-only. FW retry budget for the reinit. Zero means "use the
+    // agent default" (currently 1, matching the tt-ethtool CLI default).
+    // Ignored on Wormhole.
+    uint32 blackhole_retries = 4;
+}
+
+// Per-link outcome embedded in RetrainLinksResponse.results. Status values
+// match the per-link enum below; one result is emitted for every entry in
+// the request, in request order.
+enum LinkRetrainStatus {
+    LINK_RETRAIN_UNKNOWN = 0;
+    // The retrain was triggered and the FW acknowledged the operation. On
+    // Blackhole the FW result word is also returned in
+    // LinkRetrainResult.blackhole_fw_result.
+    LINK_RETRAIN_OK = 1;
+    // The chip / channel reference does not name a real ethernet link on
+    // this host (chip not present, channel out of range for the chip's
+    // architecture, etc.). No FW interaction was attempted.
+    LINK_RETRAIN_INVALID_LINK = 2;
+    // The architecture of the named chip is not supported by tt-ethtool's
+    // retrain path (e.g. an unsupported / unknown ARCH).
+    LINK_RETRAIN_UNSUPPORTED_ARCH = 3;
+    // FW interaction failed (mailbox timeout, retrain ack timeout, UMD I/O
+    // error, etc.). The message field carries a human-readable reason.
+    LINK_RETRAIN_FAILED = 4;
+}
+
+// Per-link result. Echoes the chip_id / channel from the request so callers
+// can correlate results without relying on positional ordering (though the
+// agent does preserve request order).
+message LinkRetrainResult {
+    uint32 chip_id = 1;
+    uint32 channel = 2;
+
+    LinkRetrainStatus status = 3;
+
+    // Human-readable detail. Empty on success; populated on every error path.
+    string message = 4;
+
+    // Architecture string of the chip that was retrained, e.g. "wormhole_b0"
+    // or "blackhole". Empty if the request never reached the FW (invalid
+    // link, no backend installed).
+    string chip_arch = 5;
+
+    // Blackhole-only. Mailbox arg0 returned by the FW after
+    // ETH_MSG_PORT_REINIT_MACPCS completes (echo of tt-ethtool's
+    // ReinitResult::fw_result). Always 0 on Wormhole or on error paths.
+    uint32 blackhole_fw_result = 6;
+}
+
+message RetrainLinksRequest {
+    // Links to retrain, processed sequentially in this order. An empty list
+    // is treated as a no-op and reported as RETRAIN_LINKS_EMPTY_REQUEST.
+    repeated LinkRetrainRequest links = 1;
+}
+
+// Top-level summary of how the batch went. Per-link detail (including
+// failure messages) lives on each LinkRetrainResult in `results`.
+enum RetrainLinksStatus {
+    RETRAIN_LINKS_UNKNOWN = 0;
+    // Every link in the request retrained successfully.
+    RETRAIN_LINKS_OK = 1;
+    // At least one link succeeded and at least one failed. Inspect
+    // `results` for per-link detail.
+    RETRAIN_LINKS_PARTIAL = 2;
+    // No link in the request succeeded. `results` still holds one entry
+    // per requested link describing why each one failed.
+    RETRAIN_LINKS_FAILED = 3;
+    // The agent has no link-retrain backend installed. This is a
+    // configuration error on the agent side; callers should not retry.
+    // `results` is empty in this case.
+    RETRAIN_LINKS_UNAVAILABLE = 4;
+    // The request carried zero links. `results` is empty.
+    RETRAIN_LINKS_EMPTY_REQUEST = 5;
+}
+
+message RetrainLinksResponse {
+    RetrainLinksStatus status = 1;
+
+    // Optional top-level summary, e.g. "3/4 links retrained successfully".
+    // Per-link diagnostics live on each LinkRetrainResult.
+    string message = 2;
+
+    // One entry per requested link, in request order. Empty when status is
+    // RETRAIN_LINKS_UNAVAILABLE or RETRAIN_LINKS_EMPTY_REQUEST.
+    repeated LinkRetrainResult results = 3;
+}
