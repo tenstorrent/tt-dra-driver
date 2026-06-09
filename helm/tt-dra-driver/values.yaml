@@ -49,8 +49,15 @@ kubeletPlugin:
       maxUnavailable: 0
   podAnnotations: {}
   podSecurityContext: {}
-  nodeSelector:
-    tenstorrent.com/has-tt: "true"
+  # Schedule the kubelet plugin on every Tenstorrent-equipped node. By
+  # default the DaemonSet matches the union of:
+  #   - tenstorrent.com/has-tt=true                                 (manually applied, e.g. via tt-ansible)
+  #   - feature.node.kubernetes.io/pci-1200_1e52.present=true       (auto-applied by NFD)
+  # Set `kubeletPlugin.affinity` to override the entire expression.
+  # `kubeletPlugin.nodeSelector` still works (empty by default) and
+  # ANDs with whatever affinity is in effect — useful for refinements
+  # like pinning to a node pool.
+  nodeSelector: {}
   tolerations: []
   affinity: {}
   kubeletRegistrarDirectoryPath: /var/lib/kubelet/plugins_registry
