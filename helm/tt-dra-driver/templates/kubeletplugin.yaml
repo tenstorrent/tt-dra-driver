@@ -110,10 +110,22 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.kubeletPlugin.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- if .Values.kubeletPlugin.affinity }}
+        {{- toYaml .Values.kubeletPlugin.affinity | nindent 8 }}
+        {{- else }}
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: tenstorrent.com/has-tt
+                    operator: In
+                    values: ["true"]
+              - matchExpressions:
+                  - key: feature.node.kubernetes.io/pci-1200_1e52.present
+                    operator: In
+                    values: ["true"]
+        {{- end }}
       {{- with .Values.kubeletPlugin.tolerations }}
       tolerations:
         {{- toYaml . | nindent 8 }}
