@@ -21,6 +21,7 @@ package fabricmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"google.golang.org/grpc"
@@ -30,14 +31,21 @@ import (
 	topologypb "github.com/tenstorrent/tt-dra-driver/internal/fabricmanager/proto/topology"
 )
 
+// ErrTopologyNotReady is returned by GetTopology when the agent reports
+// TOPOLOGY_NOT_DISCOVERED. It signals that the agent process is up and
+// reachable but has not finished its initial topology discovery yet, so the
+// caller should retry rather than treat the response as a final answer.
+var ErrTopologyNotReady = errors.New("fabric manager agent: topology not yet discovered")
+
 // TopologyClient is the read-only subset of the fabric manager agent's API
 // surface that the DRA kubelet plugin depends on. Splitting out a small
 // interface keeps the profile code testable without spinning up a real gRPC
 // server.
 type TopologyClient interface {
 	// GetTopology fetches the physical topology of the host the agent runs
-	// on. The call returns an error when the agent has not yet discovered a
-	// topology or when the RPC itself fails.
+	// on. The call returns ErrTopologyNotReady when the agent is up but has
+	// not yet completed initial topology discovery, and a wrapped error for
+	// any other RPC or unexpected-status failure.
 	GetTopology(ctx context.Context) (*topologypb.HostPhysicalTopology, error)
 }
 
@@ -81,10 +89,14 @@ func (c *AgentClient) GetTopology(ctx context.Context) (*topologypb.HostPhysical
 	if err != nil {
 		return nil, fmt.Errorf("call GetTopology: %w", err)
 	}
-	if resp.GetStatus() != agentpb.GetTopologyStatus_TOPOLOGY_OK {
+	switch resp.GetStatus() {
+	case agentpb.GetTopologyStatus_TOPOLOGY_OK:
+		return resp.GetPhysicalTopology(), nil
+	case agentpb.GetTopologyStatus_TOPOLOGY_NOT_DISCOVERED:
+		return nil, ErrTopologyNotReady
+	default:
 		return nil, fmt.Errorf("fabric manager agent reported topology status %s", resp.GetStatus())
 	}
-	return resp.GetPhysicalTopology(), nil
 }
 
 // Close releases the underlying gRPC connection.

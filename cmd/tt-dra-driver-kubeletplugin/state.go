@@ -19,19 +19,37 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
+	"k8s.io/klog/v2"
 	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1beta1"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 
+	"github.com/tenstorrent/tt-dra-driver/internal/fabricmanager"
 	"github.com/tenstorrent/tt-dra-driver/internal/profiles"
 )
+
+// enumerateBackoff bounds how long NewDeviceState waits for the fabric
+// manager agent to finish its initial topology discovery before failing the
+// driver probe. With Factor=1.5, Cap=30s, Steps=20 this caps out at roughly
+// five minutes of total wall time, which comfortably covers observed FM
+// agent startup latencies while still surfacing a hung agent.
+var enumerateBackoff = wait.Backoff{
+	Duration: 1 * time.Second,
+	Factor:   1.5,
+	Steps:    20,
+	Cap:      30 * time.Second,
+}
 
 // AllocatableDevices is a map of device name to its full descriptor for
 // quick lookup during Prepare.
@@ -66,7 +84,7 @@ type DeviceState struct {
 // active profile, initializing the CDI handler and loading any previously
 // persisted checkpoint.
 func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
-	driverResources, err := config.profile.EnumerateDevices(ctx)
+	driverResources, err := enumerateDevicesWithRetry(ctx, config.profile)
 	if err != nil {
 		return nil, fmt.Errorf("error enumerating all possible devices: %v", err)
 	}
@@ -134,6 +152,34 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	}
 
 	return state, nil
+}
+
+// enumerateDevicesWithRetry calls profile.EnumerateDevices, retrying with
+// exponential backoff while the fabric manager agent is still discovering
+// its topology (i.e. while it returns fabricmanager.ErrTopologyNotReady).
+// Any other error is returned immediately. The retry budget is bounded by
+// enumerateBackoff; once exhausted the last not-ready error is surfaced so
+// the kubelet probe fails rather than the driver publishing an empty
+// ResourceSlice.
+func enumerateDevicesWithRetry(ctx context.Context, profile profiles.Profile) (resourceslice.DriverResources, error) {
+	logger := klog.FromContext(ctx)
+	var driverResources resourceslice.DriverResources
+	err := retry.OnError(
+		enumerateBackoff,
+		func(err error) bool { return errors.Is(err, fabricmanager.ErrTopologyNotReady) },
+		func() error {
+			var err error
+			driverResources, err = profile.EnumerateDevices(ctx)
+			if err != nil && errors.Is(err, fabricmanager.ErrTopologyNotReady) {
+				logger.Info("Fabric manager agent has not finished topology discovery yet; will retry")
+			}
+			return err
+		},
+	)
+	if err != nil {
+		return resourceslice.DriverResources{}, err
+	}
+	return driverResources, nil
 }
 
 // Prepare reserves devices for a claim, materializes the per-claim CDI spec
