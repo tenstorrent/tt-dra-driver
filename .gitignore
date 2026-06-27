@@ -14,3 +14,8 @@ driver_image.tar
 .DS_Store
 .idea/
 .vscode/
+
+# docs (Sphinx) build artifacts
+docs/_build/
+docs/_generated/
+docs/output/
