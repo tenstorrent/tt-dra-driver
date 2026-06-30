@@ -14,8 +14,8 @@ from pathlib import Path
 # Display name shown in the docs, and the URL slug (usually the repo name).
 project_name = os.environ.get("DOCS_PROJECT", "Device Allocation")
 project_code = os.environ.get("DOCS_PROJECT_CODE", "tt-dra-driver")
-# Optional: path (relative to the repo root) to a helm-docs-generated chart
-# README to render verbatim into a Configuration page. Leave empty to skip.
+# Optional: path (relative to the repo root) to a generated chart README to
+# render into a Configuration page. Leave empty to skip.
 chart_readme = os.environ.get("DOCS_CHART_README", "")
 # ============================================================================
 
@@ -32,9 +32,9 @@ myst_heading_anchors = 3
 source_suffix = {".md": "markdown", ".rst": "restructuredtext"}
 exclude_patterns = ["_build", "_generated", "Thumbs.db", ".DS_Store"]
 
-# -- Optional helm-docs values include ---------------------------------------
+# -- Optional chart values include -------------------------------------------
 # Copies the generated chart README into the docs tree on every build so a
-# Configuration page can `{include} _generated/chart-values.md` verbatim.
+# Configuration page can `{include} _generated/chart-values.md`.
 _generated_dir = _docs_dir / "_generated"
 
 
@@ -97,5 +97,6 @@ html_context = {
 
 def setup(app):
     app.add_css_file("tt_theme.css")
+    app.add_css_file("tt-overrides.css")
     app.connect("config-inited", _sync_chart_values)
 
