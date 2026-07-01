@@ -40,7 +40,7 @@ kubeletPlugin:
   # below assumes the chart is installed as release `ttfm` in namespace
   # `ttfm` (matches demo/scripts/common.sh). Override per cluster as
   # needed.
-  fabricManagerAgentAddress: "ttfm-agent.ttfm.svc.cluster.local:50053"
+  fabricManagerAgentAddress: "tt-fabric-manager-agent.ttfm.svc.cluster.local:50053"
   priorityClassName: "system-node-critical"
   updateStrategy:
     type: RollingUpdate
