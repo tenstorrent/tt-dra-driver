@@ -22,15 +22,43 @@ Each device carries the same attributes; the values differ per board:
 | **n300**  | `wormhole`  | `2`         | MMIO ASIC + one bundled remote sibling.  |
 | **p150**  | `blackhole` | `1`         | Single Blackhole ASIC.                   |
 
-Other attributes on every device: `vendor`, `chipID`, `trayID`, `asicLocation`,
-`boardType`, `uniqueID`, `pciAddress`. See the [driver source](../internal/profiles/tenstorrent/tenstorrent.go)
-for the full schema.
-
 Inspect what's actually on your node:
 
 ```bash
 kubectl get resourceslice -o yaml | \
   yq '.items[].spec.devices[] | {name, attrs: .basic.attributes}'
+```
+
+## Attribute reference
+
+Every device in the `tenstorrent.com` DeviceClass carries the attributes below.
+Reference them in CEL selectors as `device.attributes["tenstorrent.com"].<name>`.
+
+| Attribute         | Type   | When set     | Value                                                                                    |
+| ----------------- | ------ | ------------ | ---------------------------------------------------------------------------------------- |
+| `vendor`          | string | always       | Constant `"tenstorrent.com"`.                                                            |
+| `chipArch`        | string | always       | ASIC architecture. Currently `"wormhole"` or `"blackhole"`.                              |
+| `chipCount`       | int    | always       | Total ASICs a workload gets from this device: the MMIO parent plus bundled remote siblings on the same tray. Match on it to require an n300 (`== 2`) or a single-chip card (`== 1`). |
+| `chipID`          | int    | always       | Host-local chip ID of the MMIO parent. Stable across agent restarts on the same host.    |
+| `uniqueID`        | string | always       | Globally unique 64-bit ASIC ID of the MMIO parent, rendered as a decimal string.         |
+| `trayID`          | int    | always       | Physical tray this bundle belongs to.                                                     |
+| `asicLocation`    | int    | always       | Position of the MMIO ASIC within its tray.                                                |
+| `boardType`       | int    | always       | Numeric board-type enum reported by Fabric Manager. Prefer `chipArch` + `chipCount` for portable selectors. |
+| `pciAddress`      | string | when known   | PCI address of the MMIO endpoint (e.g. `0000:01:00.0`).                                  |
+| `remoteChipIDs`   | string | when bundled | Comma-separated host-local chip IDs of bundled remote siblings.                          |
+| `remoteUniqueIDs` | string | when bundled | Comma-separated `uniqueID`s of bundled remote siblings.                                  |
+
+Devices also advertise capacity:
+
+| Capacity | Unit     | Value                                                                                     |
+| -------- | -------- | ----------------------------------------------------------------------------------------- |
+| `memory` | BinarySI | Aggregate DRAM across every ASIC in the bundle (bundled total, not per-ASIC).             |
+
+```{note}
+Attributes are set per MMIO-anchored *bundle*, not per ASIC. For an n300 the
+listed `chipID`, `uniqueID`, `trayID`, `asicLocation`, and `pciAddress` refer
+to the MMIO parent; the remote sibling's IDs appear in `remoteChipIDs` /
+`remoteUniqueIDs`, and its DRAM is folded into the `memory` capacity.
 ```
 
 ## Claim recipes
