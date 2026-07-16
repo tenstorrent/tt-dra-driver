@@ -64,5 +64,5 @@ behavior is maturing.
 :hidden:
 :maxdepth: 1
 
-single-card
+single-host
 ```
