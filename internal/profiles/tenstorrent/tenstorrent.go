@@ -76,6 +76,40 @@ const (
 	hugepages1GPath = "/dev/hugepages-1G"
 )
 
+// boardTypeName maps the numeric BoardType enum reported by the FM agent
+// (originating from UMD, see cluster_descriptor_types.hpp) to a stable
+// human-readable string suitable for CEL selectors on ResourceSlice
+// attributes. Selectors that pin a board type should prefer this over the
+// raw `boardType` int: the int values change with UMD's enum and are not
+// documented externally.
+//
+// Any value not in this map surfaces as "unknown", including future
+// BoardType additions until this map catches up.
+var boardTypeName = map[uint32]string{
+	0:  "e75",
+	1:  "e150",
+	2:  "e300",
+	3:  "n150",
+	4:  "n300",
+	5:  "p100",
+	6:  "p150",
+	7:  "p300",
+	8:  "galaxy",
+	9:  "wh-galaxy", // UMD BoardType::UBB / UBB_WORMHOLE
+	10: "bh-galaxy", // UMD BoardType::UBB_BLACKHOLE
+	11: "quasar",
+	12: "unknown",
+}
+
+// boardNameFor returns the stable string for a numeric BoardType, or
+// "unknown" when the value has no mapping.
+func boardNameFor(bt uint32) string {
+	if name, ok := boardTypeName[bt]; ok {
+		return name
+	}
+	return "unknown"
+}
+
 // hostBundle represents the bundling decision for a single MMIO-capable
 // ASIC: the MMIO chip itself plus any non-MMIO ("remote") chips on the
 // same physical tray that are reachable only through it. Remote chips do
@@ -325,6 +359,13 @@ func bundleToDevice(bundle hostBundle) resourceapi.Device {
 			},
 			"boardType": {
 				IntValue: ptr.To(int64(mmio.GetBoardType())),
+			},
+			// boardName is the stable, human-readable form of boardType.
+			// Prefer it in CEL selectors ("n150", "wh-galaxy", ...) over
+			// matching against boardType's raw enum value, which comes
+			// from UMD and is not stable across releases.
+			"boardName": {
+				StringValue: ptr.To(boardNameFor(mmio.GetBoardType())),
 			},
 			"chipArch": {
 				StringValue: ptr.To(mmio.GetChipArch()),
