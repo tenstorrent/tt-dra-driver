@@ -59,3 +59,10 @@ staged fabric topology the `ResourceSlice` set can be empty and claims will not
 bind. This is an environment limitation rather than a failure. Allocation
 behavior is maturing.
 ```
+
+```{toctree}
+:hidden:
+:maxdepth: 1
+
+single-card
+```
