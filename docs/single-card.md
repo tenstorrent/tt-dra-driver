@@ -14,13 +14,16 @@ when it holds that one device.
 
 ## How each card appears in a ResourceSlice
 
-Each device carries the same attributes; the values differ per board:
+Each device carries the same attributes; the values differ per board. Match on
+`boardName` for exact board discrimination — `chipArch` + `chipCount` alone
+cannot always distinguish a single-board card from a same-arch Galaxy on a
+mixed-hardware cluster.
 
-| Card      | `chipArch`  | `chipCount` | Notes                                    |
-| --------- | ----------- | ----------- | ---------------------------------------- |
-| **n150**  | `wormhole`  | `1`         | Single Wormhole ASIC, one MMIO endpoint. |
-| **n300**  | `wormhole`  | `2`         | MMIO ASIC + one bundled remote sibling.  |
-| **p150**  | `blackhole` | `1`         | Single Blackhole ASIC.                   |
+| Card      | `boardName` | `chipArch`  | `chipCount` | Notes                                    |
+| --------- | ----------- | ----------- | ----------- | ---------------------------------------- |
+| **n150**  | `n150`      | `wormhole`  | `1`         | Single Wormhole ASIC, one MMIO endpoint. |
+| **n300**  | `n300`      | `wormhole`  | `2`         | MMIO ASIC + one bundled remote sibling.  |
+| **p150**  | `p150`      | `blackhole` | `1`         | Single Blackhole ASIC.                   |
 
 Inspect what's actually on your node:
 
@@ -43,7 +46,8 @@ Reference them in CEL selectors as `device.attributes["tenstorrent.com"].<name>`
 | `uniqueID`        | string | always       | Globally unique 64-bit ASIC ID of the MMIO parent, rendered as a decimal string.         |
 | `trayID`          | int    | always       | Physical tray this bundle belongs to.                                                     |
 | `asicLocation`    | int    | always       | Position of the MMIO ASIC within its tray.                                                |
-| `boardType`       | int    | always       | Numeric board-type enum reported by Fabric Manager. Prefer `chipArch` + `chipCount` for portable selectors. |
+| `boardName`       | string | always       | Human-readable board type: `"n150"`, `"n300"`, `"p150"`, `"p100"`, `"p300"`, `"e75"`, `"e150"`, `"e300"`, `"galaxy"`, `"wh-galaxy"`, `"bh-galaxy"`, `"quasar"`, or `"unknown"`. Prefer this over `boardType` in selectors. |
+| `boardType`       | int    | always       | Numeric board-type enum reported by Fabric Manager. Values are not stable across UMD releases; prefer `boardName`.                        |
 | `pciAddress`      | string | when known   | PCI address of the MMIO endpoint (e.g. `0000:01:00.0`).                                  |
 | `remoteChipIDs`   | string | when bundled | Comma-separated host-local chip IDs of bundled remote siblings.                          |
 | `remoteUniqueIDs` | string | when bundled | Comma-separated `uniqueID`s of bundled remote siblings.                                  |
@@ -77,14 +81,13 @@ metadata:
 spec:
   devices:
     requests:
-      - name: chip
+      - name: board
         exactly:
           deviceClassName: tenstorrent.com
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].chipArch == "wormhole" &&
-                  device.attributes["tenstorrent.com"].chipCount == 1
+                  device.attributes["tenstorrent.com"].boardName == "n150"
 ```
 
 ### Any n300
@@ -97,14 +100,13 @@ metadata:
 spec:
   devices:
     requests:
-      - name: chip
+      - name: board
         exactly:
           deviceClassName: tenstorrent.com
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].chipArch == "wormhole" &&
-                  device.attributes["tenstorrent.com"].chipCount == 2
+                  device.attributes["tenstorrent.com"].boardName == "n300"
 ```
 
 The pod that holds this claim gets access to both ASICs on the board.
@@ -119,14 +121,13 @@ metadata:
 spec:
   devices:
     requests:
-      - name: chip
+      - name: board
         exactly:
           deviceClassName: tenstorrent.com
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].chipArch == "blackhole" &&
-                  device.attributes["tenstorrent.com"].chipCount == 1
+                  device.attributes["tenstorrent.com"].boardName == "p150"
 ```
 
 ### A specific chip by uniqueID
@@ -141,7 +142,7 @@ metadata:
 spec:
   devices:
     requests:
-      - name: chip
+      - name: board
         exactly:
           deviceClassName: tenstorrent.com
           selectors:
@@ -163,14 +164,13 @@ metadata:
 spec:
   devices:
     requests:
-      - name: chip
+      - name: board
         exactly:
           deviceClassName: tenstorrent.com
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].chipArch == "wormhole" &&
-                  device.attributes["tenstorrent.com"].chipCount == 1
+                  device.attributes["tenstorrent.com"].boardName == "n150"
 ---
 apiVersion: v1
 kind: Pod
@@ -183,9 +183,9 @@ spec:
       command: ["sleep", "infinity"]
       resources:
         claims:
-          - name: chip
+          - name: board
   resourceClaims:
-    - name: chip
+    - name: board
       resourceClaimName: any-n150
 ```
 
@@ -211,14 +211,13 @@ metadata: { name: n150-a }
 spec:
   devices:
     requests:
-      - name: chip
+      - name: board
         exactly:
           deviceClassName: tenstorrent.com
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].chipArch == "wormhole" &&
-                  device.attributes["tenstorrent.com"].chipCount == 1
+                  device.attributes["tenstorrent.com"].boardName == "n150"
 ---
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
@@ -226,14 +225,13 @@ metadata: { name: n150-b }
 spec:
   devices:
     requests:
-      - name: chip
+      - name: board
         exactly:
           deviceClassName: tenstorrent.com
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].chipArch == "wormhole" &&
-                  device.attributes["tenstorrent.com"].chipCount == 1
+                  device.attributes["tenstorrent.com"].boardName == "n150"
 ---
 apiVersion: v1
 kind: Pod
@@ -270,14 +268,13 @@ spec:
   spec:
     devices:
       requests:
-        - name: chip
+        - name: board
           exactly:
             deviceClassName: tenstorrent.com
             selectors:
               - cel:
                   expression: |
-                    device.attributes["tenstorrent.com"].chipArch == "wormhole" &&
-                    device.attributes["tenstorrent.com"].chipCount == 1
+                    device.attributes["tenstorrent.com"].boardName == "n150"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -296,9 +293,9 @@ spec:
           image: <your-image>
           resources:
             claims:
-              - name: chip
+              - name: board
       resourceClaims:
-        - name: chip
+        - name: board
           resourceClaimTemplateName: n150-template
 ```
 
@@ -313,10 +310,12 @@ Each of the three pods gets its own n150 on whatever host has one free.
 - Confirm your CEL selector matches something. Grab the attributes from a real
   device and hand-evaluate: `kubectl get resourceslice <name> -o yaml`.
 
-**Wrong device bound (e.g. got an n300 when I wanted an n150).**
-- Check `chipCount` on the CEL expression. n150 = 1, n300 = 2.
-- If you have a mix of Wormhole and Blackhole in the same cluster, pin
-  `chipArch` too.
+**Wrong device bound (e.g. got an n300 when I wanted an n150, or a Galaxy MMIO chip when I wanted an n150).**
+- Prefer `boardName == "n150"` (or `"n300"`, `"p150"`, ...) over selectors
+  that mix `chipArch` and `chipCount`. In clusters that mix single-board
+  cards with a Wormhole Galaxy, a standalone Galaxy MMIO bundle can present
+  as `chipArch == "wormhole"` with `chipCount == 1` — the same as an n150.
+  Only `boardName` (or the raw numeric `boardType`) discriminates.
 
 **Pod scheduled but `/dev/tenstorrent` empty.**
 - The CDI edits are still evolving. Confirm the driver version and check the
