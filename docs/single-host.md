@@ -6,14 +6,14 @@ This page walks through Tenstorrent claim recipes for workloads that run on
 - **n150** — single-chip Wormhole board.
 - **n300** — dual-chip Wormhole board (two ASICs on one tray).
 - **p150** — single-chip Blackhole board.
-- **Wormhole Galaxy on one host** — a full UBB (`wh-galaxy`) wired to a single host via MMIO fan-out.
-- **Blackhole UBB on one host** — a full UBB (`bh-galaxy`) wired to a single host.
+- **Wormhole Galaxy (6U UBB)** — 32-chip UBB where every chip is PCIe-MMIO on one host.
+- **Blackhole UBB** — same all-MMIO shape as the Wormhole 6U.
 
-The DRA driver publishes one `ResourceSlice` device per MMIO-anchored bundle,
-so each *board* is one device regardless of how many ASICs sit on it. An n300
-bundles its remote sibling into the same claim; a whole Galaxy or UBB on one
-host bundles every remote on the same tray into the MMIO parent — the
-container sees all its chips through the one device.
+The DRA driver publishes one `ResourceSlice` device per MMIO-anchored
+bundle. An n300 bundles its non-MMIO remote sibling under the MMIO parent so
+a single claim gives the container both chips. A 6U Wormhole Galaxy exposes
+every chip via PCIe MMIO, so all 32 surface as individual devices — you claim
+them as a set (`count: 32`), not as a single bundle.
 
 ```{note}
 Multi-host layouts — one host's share of a multi-host Galaxy, or a whole
@@ -29,20 +29,21 @@ Each device carries the same attributes; the values differ per board. Match on
 `boardName` for exact board discrimination — `chipArch` + `chipCount` alone
 cannot always distinguish a single-board card from a same-arch Galaxy.
 
-| Board                     | `boardName` | `chipArch`  | `chipCount` (single-host)   | Notes                                                                   |
-| ------------------------- | ----------- | ----------- | --------------------------- | ----------------------------------------------------------------------- |
-| **n150**                  | `n150`      | `wormhole`  | `1`                         | Single Wormhole ASIC, one MMIO endpoint.                                |
-| **n300**                  | `n300`      | `wormhole`  | `2`                         | MMIO ASIC + one bundled remote sibling.                                 |
-| **p150**                  | `p150`      | `blackhole` | `1`                         | Single Blackhole ASIC.                                                  |
-| **Wormhole Galaxy (UBB)** | `wh-galaxy` | `wormhole`  | 32 minus standalone-MMIO(s) | Whole UBB wired to one host: one MMIO chip adopts every remote on the tray. |
-| **Blackhole UBB**         | `bh-galaxy` | `blackhole` | 32 minus standalone-MMIO(s) | Whole UBB wired to one host, same shape as WH Galaxy above.             |
+| Board                        | `boardName` | `chipArch`  | Bundles per host  | `chipCount` per bundle | Notes                                                                          |
+| ---------------------------- | ----------- | ----------- | ----------------- | ---------------------- | ------------------------------------------------------------------------------ |
+| **n150**                     | `n150`      | `wormhole`  | 1                 | `1`                    | Single Wormhole ASIC, one MMIO endpoint.                                       |
+| **n300**                     | `n300`      | `wormhole`  | 1                 | `2`                    | MMIO ASIC + one bundled remote sibling on the same tray.                       |
+| **p150**                     | `p150`      | `blackhole` | 1                 | `1`                    | Single Blackhole ASIC.                                                         |
+| **Wormhole Galaxy (6U UBB)** | `wh-galaxy` | `wormhole`  | 32                | `1`                    | All 32 chips are PCIe-MMIO — each surfaces as its own bundle. Claim with `count: 32`. |
+| **Blackhole UBB**            | `bh-galaxy` | `blackhole` | N (per your board)| `1`                    | Same all-MMIO shape as WH Galaxy; verify per-board with `kubectl get resourceslice`. |
 
 ```{note}
-For a UBB on one host, the *big* bundle's `chipCount` equals the total ASIC
-count on the tray (32 for a standard UBB) minus any additional MMIO chips that
-became standalone bundles. Always verify against your cluster with
-`kubectl get resourceslice -o yaml` — layouts vary with how PCIe fan-out is
-wired.
+Bundling groups *non-MMIO* chips under their MMIO parent on the same tray;
+for boards where every chip is MMIO (Wormhole 6U Galaxy), no adoption happens
+and each chip is its own `chipCount == 1` bundle. Use `count: N` in the
+request to claim the whole board as a set. Verify with
+`kubectl get resourceslice -o yaml` — the actual number of bundles a host
+exposes is authoritative.
 ```
 
 Inspect what's actually on your node:
@@ -150,13 +151,10 @@ spec:
                   device.attributes["tenstorrent.com"].boardName == "p150"
 ```
 
-### Whole Wormhole Galaxy (single host)
+### Whole Wormhole Galaxy (6U UBB, single host)
 
-Claim the entire UBB when it's wired to one host. The `chipCount` filter picks
-the *big* bundle (the MMIO chip that adopted every remote on the tray) rather
-than any standalone-MMIO bundles that share the same `boardName`. Adjust `32`
-if your layout leaves additional MMIO chips as standalone bundles — check with
-`kubectl get resourceslice -o yaml`.
+Every chip on the 6U UBB is PCIe-MMIO, so DRA publishes 32 individual
+`chipCount == 1` bundles per host. Claim them as a set with `count: 32`:
 
 ```yaml
 apiVersion: resource.k8s.io/v1
@@ -166,24 +164,24 @@ metadata:
 spec:
   devices:
     requests:
-      - name: board
+      - name: boards
         exactly:
           deviceClassName: tenstorrent.com
+          count: 32
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].boardName == "wh-galaxy" &&
-                  device.attributes["tenstorrent.com"].chipCount == 32
+                  device.attributes["tenstorrent.com"].boardName == "wh-galaxy"
 ```
 
-The pod that holds this claim gets access to all 32 Wormhole ASICs through
-the single `/dev/tenstorrent/<N>` device node of the MMIO parent.
+The container ends up with 32 `/dev/tenstorrent/<N>` device nodes, one per
+ASIC. Adjust `count` if your host has more than one Galaxy attached.
 
 ### Whole Blackhole UBB (single host)
 
-Same shape as the Wormhole Galaxy recipe, with `boardName == "bh-galaxy"`.
-Verify `chipCount` against your board — Blackhole UBB layouts may differ from
-Wormhole.
+Same pattern as the Wormhole Galaxy recipe, with `boardName == "bh-galaxy"`.
+Verify the actual per-host bundle count on your board with
+`kubectl get resourceslice -o yaml` and set `count` accordingly.
 
 ```yaml
 apiVersion: resource.k8s.io/v1
@@ -193,14 +191,14 @@ metadata:
 spec:
   devices:
     requests:
-      - name: board
+      - name: boards
         exactly:
           deviceClassName: tenstorrent.com
+          count: 32
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].boardName == "bh-galaxy" &&
-                  device.attributes["tenstorrent.com"].chipCount == 32
+                  device.attributes["tenstorrent.com"].boardName == "bh-galaxy"
 ```
 
 ### A specific chip by uniqueID
@@ -390,12 +388,10 @@ Each of the three pods gets its own n150 on whatever host has one free.
   as `chipArch == "wormhole"` with `chipCount == 1` — the same as an n150.
   Only `boardName` (or the raw numeric `boardType`) discriminates.
 
-**Galaxy claim bound to a bundle with only 1 chip.**
-- Your Galaxy tray has more than one MMIO ASIC. The lowest-`asicLocation`
-  MMIO adopts every remote; the others become standalone `chipCount == 1`
-  bundles. Match on `chipCount == <full ASIC count>` (32 for a standard UBB)
-  to pin the big bundle, or list the exact ASIC count from
-  `kubectl get resourceslice -o yaml` on that host.
+**"Whole Galaxy" claim only bound one chip.**
+- Every UBB chip is its own bundle — a single request without `count` binds
+  exactly one. Add `count: 32` (or the actual per-host bundle count you see
+  in `kubectl get resourceslice -o yaml`) so DRA allocates the full set.
 
 **Pod scheduled but `/dev/tenstorrent` empty.**
 - The CDI edits are still evolving. Confirm the driver version and check the
