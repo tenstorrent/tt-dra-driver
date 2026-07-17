@@ -4,7 +4,7 @@ This page walks through Tenstorrent claim recipes for workloads that run on
 **one host**. It covers:
 
 - **n150** — single-chip Wormhole board.
-- **n300** — dual-chip Wormhole board (two ASICs on one tray).
+- **n300** — dual-chip Wormhole board (two ASICs on one PCIe card).
 - **p150** — single-chip Blackhole board.
 - **Wormhole Galaxy (6U UBB)** — 32-chip UBB where every chip is PCIe-MMIO on one host.
 - **Blackhole UBB** — same all-MMIO shape as the Wormhole 6U.
