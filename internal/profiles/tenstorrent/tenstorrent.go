@@ -94,9 +94,9 @@ var boardTypeName = map[uint32]string{
 	5:  "p100",
 	6:  "p150",
 	7:  "p300",
-	8:  "galaxy",
-	9:  "wh-galaxy", // UMD BoardType::UBB / UBB_WORMHOLE
-	10: "bh-galaxy", // UMD BoardType::UBB_BLACKHOLE
+	8:  "galaxy", // legacy: UMD BoardType::GALAXY — TG 4U, deprecated in favor of 6U UBB
+	9:  "galaxy-wormhole", // matches KMD sysfs tt_card_type; UMD BoardType::UBB / UBB_WORMHOLE
+	10: "galaxy-blackhole", // matches KMD sysfs tt_card_type; UMD BoardType::UBB_BLACKHOLE
 	11: "quasar",
 	12: "unknown",
 }
