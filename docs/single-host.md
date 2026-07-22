@@ -34,8 +34,8 @@ cannot always distinguish a single-board card from a same-arch Galaxy.
 | **n150**                     | `n150`      | `wormhole`  | 1                 | `1`                    | Single Wormhole ASIC, one MMIO endpoint.                                       |
 | **n300**                     | `n300`      | `wormhole`  | 1                 | `2`                    | MMIO ASIC + one bundled remote sibling on the same tray.                       |
 | **p150**                     | `p150`      | `blackhole` | 1                 | `1`                    | Single Blackhole ASIC.                                                         |
-| **Wormhole Galaxy (6U UBB)** | `wh-galaxy` | `wormhole`  | 32                | `1`                    | All 32 chips are PCIe-MMIO — each surfaces as its own bundle. Claim with `count: 32`. |
-| **Blackhole UBB**            | `bh-galaxy` | `blackhole` | N (per your board)| `1`                    | Same all-MMIO shape as WH Galaxy; verify per-board with `kubectl get resourceslice`. |
+| **Wormhole Galaxy (6U UBB)** | `galaxy-wormhole`  | `wormhole`  | 32                | `1`                    | All 32 chips are PCIe-MMIO — each surfaces as its own bundle. Claim with `count: 32`. |
+| **Blackhole UBB**            | `galaxy-blackhole` | `blackhole` | N (per your board)| `1`                    | Same all-MMIO shape as WH Galaxy; verify per-board with `kubectl get resourceslice`. |
 
 ```{note}
 Bundling groups *non-MMIO* chips under their MMIO parent on the same tray;
@@ -67,7 +67,7 @@ Reference them in CEL selectors as `device.attributes["tenstorrent.com"].<name>`
 | `uniqueID`        | string | always       | Globally unique 64-bit ASIC ID of the MMIO parent, rendered as a decimal string.         |
 | `trayID`          | int    | always       | Physical tray this bundle belongs to.                                                     |
 | `asicLocation`    | int    | always       | Position of the MMIO ASIC within its tray.                                                |
-| `boardName`       | string | always       | Human-readable board type: `"n150"`, `"n300"`, `"p150"`, `"p100"`, `"p300"`, `"e75"`, `"e150"`, `"e300"`, `"galaxy"`, `"wh-galaxy"`, `"bh-galaxy"`, `"quasar"`, or `"unknown"`. Prefer this over `boardType` in selectors. |
+| `boardName`       | string | always       | Human-readable board type: `"n150"`, `"n300"`, `"p150"`, `"p100"`, `"p300"`, `"e75"`, `"e150"`, `"e300"`, `"galaxy"`, `"galaxy-wormhole"`, `"galaxy-blackhole"`, `"quasar"`, or `"unknown"`. Prefer this over `boardType` in selectors. The UBB values match KMD's sysfs `tt_card_type`. |
 | `boardType`       | int    | always       | Numeric board-type enum reported by Fabric Manager. Values are not stable across UMD releases; prefer `boardName`.                        |
 | `pciAddress`      | string | when known   | PCI address of the MMIO endpoint (e.g. `0000:01:00.0`).                                  |
 | `remoteChipIDs`   | string | when bundled | Comma-separated host-local chip IDs of bundled remote siblings.                          |
@@ -171,7 +171,7 @@ spec:
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].boardName == "wh-galaxy"
+                  device.attributes["tenstorrent.com"].boardName == "galaxy-wormhole"
 ```
 
 The container ends up with 32 `/dev/tenstorrent/<N>` device nodes, one per
@@ -179,7 +179,7 @@ ASIC. Adjust `count` if your host has more than one Galaxy attached.
 
 ### Whole Blackhole UBB (single host)
 
-Same pattern as the Wormhole Galaxy recipe, with `boardName == "bh-galaxy"`.
+Same pattern as the Wormhole Galaxy recipe, with `boardName == "galaxy-blackhole"`.
 Verify the actual per-host bundle count on your board with
 `kubectl get resourceslice -o yaml` and set `count` accordingly.
 
@@ -198,7 +198,7 @@ spec:
           selectors:
             - cel:
                 expression: |
-                  device.attributes["tenstorrent.com"].boardName == "bh-galaxy"
+                  device.attributes["tenstorrent.com"].boardName == "galaxy-blackhole"
 ```
 
 ### A specific chip by uniqueID
