@@ -18,12 +18,13 @@
 // accelerators.
 //
 // Devices are discovered via the Tenstorrent Fabric Manager (TTFM) agent
-// running on the same node: EnumerateDevices issues a GetTopology RPC and
+// running on the same node: WatchDevices opens a WatchTopology stream and
 // converts each MMIO-capable ASIC the agent reports into a ResourceSlice
-// device. Non-MMIO ("remote") ASICs are not separately allocatable: they
-// have no host-visible /dev/tenstorrent/<N> entry, so they are bundled
-// into the MMIO parent on the same physical tray and travel with it
-// whenever it is allocated.
+// device, re-converting whenever the agent reports a change. Non-MMIO
+// ("remote") ASICs are not separately allocatable: they have no
+// host-visible /dev/tenstorrent/<N> entry, so they are bundled into the
+// MMIO parent on the same physical tray and travel with it whenever it is
+// allocated.
 package tenstorrent
 
 import (
@@ -94,8 +95,8 @@ var boardTypeName = map[uint32]string{
 	5:  "p100",
 	6:  "p150",
 	7:  "p300",
-	8:  "galaxy", // legacy: UMD BoardType::GALAXY — TG 4U, deprecated in favor of 6U UBB
-	9:  "galaxy-wormhole", // matches KMD sysfs tt_card_type; UMD BoardType::UBB / UBB_WORMHOLE
+	8:  "galaxy",           // legacy: UMD BoardType::GALAXY — TG 4U, deprecated in favor of 6U UBB
+	9:  "galaxy-wormhole",  // matches KMD sysfs tt_card_type; UMD BoardType::UBB / UBB_WORMHOLE
 	10: "galaxy-blackhole", // matches KMD sysfs tt_card_type; UMD BoardType::UBB_BLACKHOLE
 	11: "quasar",
 	12: "unknown",
@@ -123,10 +124,10 @@ type hostBundle struct {
 
 // Profile is the Tenstorrent device profile.
 //
-// EnumerateDevices populates an internal map from ResourceSlice device
-// name to the hostBundle that produced it; ApplyConfig consults that map
-// to build per-device CDI container edits (e.g. /dev/tenstorrent/<chipID>
-// for the bundle's MMIO parent).
+// Each topology the agent reports populates an internal map from
+// ResourceSlice device name to the hostBundle that produced it; ApplyConfig
+// consults that map to build per-device CDI container edits (e.g.
+// /dev/tenstorrent/<chipID> for the bundle's MMIO parent).
 type Profile struct {
 	nodeName string
 	topology fabricmanager.TopologyClient
@@ -147,18 +148,67 @@ func NewProfile(nodeName string, topology fabricmanager.TopologyClient) *Profile
 	}
 }
 
-// EnumerateDevices implements profiles.Profile.
-func (p *Profile) EnumerateDevices(ctx context.Context) (resourceslice.DriverResources, error) {
+// WatchDevices implements profiles.Profile.
+func (p *Profile) WatchDevices(ctx context.Context) profiles.DeviceWatch {
 	if p.topology == nil {
-		return resourceslice.DriverResources{}, fmt.Errorf("tenstorrent profile: fabric manager agent client is not configured")
+		return failedWatch(errors.New("tenstorrent profile: fabric manager agent client is not configured"))
 	}
 
-	hostTopology, err := p.topology.GetTopology(ctx)
-	if err != nil {
-		return resourceslice.DriverResources{}, fmt.Errorf("tenstorrent profile: get topology from fabric manager agent: %w", err)
-	}
+	w := &deviceWatch{updates: make(chan resourceslice.DriverResources)}
+	go w.run(ctx, p, p.topology.WatchTopology(ctx))
+	return w
+}
+
+// deviceWatch converts a fabric-manager topology watch into the
+// profiles.DeviceWatch the kubelet plugin consumes.
+type deviceWatch struct {
+	updates chan resourceslice.DriverResources
+
+	// err is written by run before it closes updates, and read by Err only
+	// after the close has been observed.
+	err error
+}
+
+// Updates implements profiles.DeviceWatch.
+func (w *deviceWatch) Updates() <-chan resourceslice.DriverResources { return w.updates }
+
+// Err implements profiles.DeviceWatch.
+func (w *deviceWatch) Err() error { return w.err }
+
+// run translates every usable topology snapshot into resources to publish.
+// Snapshots that carry no usable topology — discovery has not finished, or
+// it failed — are logged and skipped rather than forwarded as an empty
+// device set: they say nothing about the host, so the driver should keep
+// serving whatever it last published.
+func (w *deviceWatch) run(ctx context.Context, p *Profile, topology fabricmanager.TopologyWatch) {
+	defer close(w.updates)
 
 	logger := klog.FromContext(ctx)
+	for snapshot := range topology.Updates() {
+		if !snapshot.Usable() {
+			logger.Info("Ignoring fabric manager topology snapshot with no usable topology",
+				"status", snapshot.Status,
+				"discoveryError", snapshot.DiscoveryError(),
+				"version", snapshot.Version,
+			)
+			continue
+		}
+
+		resources := p.applyTopology(snapshot.Topology, logger)
+		select {
+		case w.updates <- resources:
+		case <-ctx.Done():
+			return
+		}
+	}
+	w.err = topology.Err()
+}
+
+// applyTopology converts a host topology into the resources to publish and
+// records the device-to-bundle mapping that ApplyConfig needs. The mapping
+// is updated before the resources are handed over so that a device is never
+// published before the profile can produce CDI edits for it.
+func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, logger klog.Logger) resourceslice.DriverResources {
 	bundles := bundleHostASICs(hostTopology.GetAsics(), logger)
 
 	devices := make([]resourceapi.Device, 0, len(bundles))
@@ -183,7 +233,15 @@ func (p *Profile) EnumerateDevices(ctx context.Context) (resourceslice.DriverRes
 				},
 			},
 		},
-	}, nil
+	}
+}
+
+// failedWatch returns an already-finished watch carrying err, so that a
+// misconfigured profile reports through the same path as a watch that died.
+func failedWatch(err error) profiles.DeviceWatch {
+	updates := make(chan resourceslice.DriverResources)
+	close(updates)
+	return &deviceWatch{updates: updates, err: err}
 }
 
 // CommonContainerEdits implements profiles.Profile.
@@ -232,9 +290,9 @@ func (p *Profile) Validate(config runtime.Object) error {
 //
 // It produces per-device CDI container edits that expose
 // /dev/tenstorrent/<chipID> to the workload for every allocated device.
-// Because EnumerateDevices only ever publishes MMIO-capable ASICs (with
-// any non-MMIO siblings bundled in), every entry in results corresponds
-// to exactly one host-visible character device.
+// Because the profile only ever publishes MMIO-capable ASICs (with any
+// non-MMIO siblings bundled in), every entry in results corresponds to
+// exactly one host-visible character device.
 func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.DeviceRequestAllocationResult) (profiles.PerDeviceCDIContainerEdits, error) {
 	if config != nil {
 		return nil, errors.New("tenstorrent profile: opaque configuration is not supported yet")
@@ -247,12 +305,12 @@ func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devi
 	for _, result := range results {
 		bundle, ok := p.bundleByDevice[result.Device]
 		if !ok {
-			return nil, fmt.Errorf("tenstorrent profile: device %q is not in the latest enumeration", result.Device)
+			return nil, fmt.Errorf("tenstorrent profile: device %q is not in the latest topology reported by the fabric manager agent", result.Device)
 		}
-		// Defensive: EnumerateDevices is responsible for filtering
-		// non-MMIO chips out of the ResourceSlice. If one ever leaks
-		// through, fail loudly rather than silently producing a CDI spec
-		// with no device node.
+		// Defensive: applyTopology is responsible for filtering non-MMIO
+		// chips out of the ResourceSlice. If one ever leaks through, fail
+		// loudly rather than silently producing a CDI spec with no device
+		// node.
 		if !bundle.mmio.GetIsMmioCapable() {
 			return nil, fmt.Errorf("tenstorrent profile: device %q resolves to a non-MMIO ASIC, which should never appear in the ResourceSlice", result.Device)
 		}

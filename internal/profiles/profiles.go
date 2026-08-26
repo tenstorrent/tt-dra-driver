@@ -56,14 +56,36 @@ func (pds PreparedDevices) GetDevices() []*drapbv1.Device {
 	return devices
 }
 
+// DeviceWatch is a live view of the devices a profile can publish for this
+// node.
+type DeviceWatch interface {
+	// Updates delivers the set of publishable resources as of the moment the
+	// watch started, and then a fresh set every time the underlying devices
+	// change. Each value is complete and replaces the previous one.
+	//
+	// The channel is closed when the watch stops: either the context passed
+	// to WatchDevices was cancelled, or the watch failed in a way retrying
+	// cannot fix. Err says which.
+	Updates() <-chan resourceslice.DriverResources
+
+	// Err returns the error that stopped the watch, or nil if it stopped
+	// because its context was cancelled. It must only be read after Updates
+	// has been observed closed.
+	Err() error
+}
+
 // Profile describes a kind of device that can be managed by the driver.
 type Profile interface {
 	ConfigHandler
-	// EnumerateDevices returns the resource slice published into the cluster
-	// for the node the driver is running on. Implementations may perform
-	// remote calls (e.g. to a per-node device-discovery agent) and should
-	// honour ctx for cancellation and timeouts.
-	EnumerateDevices(ctx context.Context) (resourceslice.DriverResources, error)
+	// WatchDevices watches the profile's device source and reports the
+	// resource slices to publish into the cluster for the node the driver is
+	// running on. It returns immediately; the first set of resources arrives
+	// on the watch's channel once the source has something to report, which
+	// for a remote source (e.g. a per-node device-discovery agent) may take
+	// as long as that source needs to come up. Implementations run until ctx
+	// is cancelled and are responsible for riding out transient failures of
+	// their source.
+	WatchDevices(ctx context.Context) DeviceWatch
 	// CommonContainerEdits returns CDI container edits that must be applied
 	// to every container that consumes a device managed by this profile,
 	// independent of which specific devices were allocated. Returning nil

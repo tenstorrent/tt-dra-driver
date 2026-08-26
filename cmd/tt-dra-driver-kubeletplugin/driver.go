@@ -21,13 +21,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	coreclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
+	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
+
+	"github.com/tenstorrent/tt-dra-driver/internal/profiles"
 )
 
 // driver is the kubelet plugin handler that satisfies the
@@ -40,16 +44,32 @@ type driver struct {
 	cancelCtx   func(error)
 }
 
-// NewDriver wires up the kubelet plugin: it builds the device state, starts
-// the kubeletplugin helper, optionally starts the healthcheck server and
-// publishes the initial set of resource slices.
+// initialDevicesTimeout bounds how long NewDriver waits for the profile's
+// device watch to report the devices on this node. The wait covers the
+// fabric manager agent coming up and completing its first topology
+// discovery, which is why it is generous; when it expires the driver fails
+// its kubelet probe and gets restarted rather than coming up advertising no
+// devices at all.
+const initialDevicesTimeout = 5 * time.Minute
+
+// NewDriver wires up the kubelet plugin: it waits for the profile's first
+// report of the node's devices, builds the device state, starts the
+// kubeletplugin helper, optionally starts the healthcheck server, publishes
+// the resource slices and then keeps them in sync with the profile for as
+// long as ctx lives.
 func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 	d := &driver{
 		client:    config.coreclient,
 		cancelCtx: config.cancelMainCtx,
 	}
 
-	state, err := NewDeviceState(ctx, config)
+	watch := config.profile.WatchDevices(ctx)
+	driverResources, err := waitForInitialDevices(ctx, watch, initialDevicesTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	state, err := NewDeviceState(config, driverResources)
 	if err != nil {
 		return nil, err
 	}
@@ -73,11 +93,75 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 		return nil, fmt.Errorf("start healthcheck: %w", err)
 	}
 
-	if err := helper.PublishResources(ctx, state.driverResources); err != nil {
+	if err := helper.PublishResources(ctx, state.Resources()); err != nil {
 		return nil, err
 	}
 
+	go d.republishDevices(ctx, watch)
+
 	return d, nil
+}
+
+// waitForInitialDevices blocks until the watch reports the node's devices
+// for the first time. A watch rides out transient failures of its source on
+// its own, so the only reasons this returns an error are the watch failing
+// permanently, the caller going away, or the source taking longer than
+// timeout to produce anything.
+func waitForInitialDevices(ctx context.Context, watch profiles.DeviceWatch, timeout time.Duration) (resourceslice.DriverResources, error) {
+	logger := klog.FromContext(ctx)
+	logger.Info("Waiting for the initial set of devices", "timeout", timeout)
+
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	select {
+	case driverResources, ok := <-watch.Updates():
+		if !ok {
+			if err := watch.Err(); err != nil {
+				return resourceslice.DriverResources{}, fmt.Errorf("watch devices: %w", err)
+			}
+			return resourceslice.DriverResources{}, errors.New("device watch stopped before reporting any devices")
+		}
+		return driverResources, nil
+	case <-deadline.C:
+		return resourceslice.DriverResources{}, fmt.Errorf("no devices reported within %s", timeout)
+	case <-ctx.Done():
+		return resourceslice.DriverResources{}, ctx.Err()
+	}
+}
+
+// republishDevices keeps the published ResourceSlices in step with the
+// devices the profile reports, for as long as the watch runs. It exits when
+// ctx is cancelled; if the watch instead stops on its own the driver can no
+// longer learn about topology changes, which is treated as fatal so that the
+// kubelet restarts the plugin with a fresh watch.
+func (d *driver) republishDevices(ctx context.Context, watch profiles.DeviceWatch) {
+	logger := klog.FromContext(ctx)
+
+	for driverResources := range watch.Updates() {
+		if !d.state.SetResources(driverResources) {
+			logger.V(4).Info("Devices reported by the profile are unchanged; not republishing")
+			continue
+		}
+		logger.Info("Devices changed; republishing resource slices",
+			"numDevices", d.state.AllocatableCount(),
+		)
+		if err := d.helper.PublishResources(ctx, driverResources); err != nil {
+			// PublishResources only fails on misconfiguration, which cannot
+			// resolve itself, so let HandleError decide the driver's fate.
+			d.HandleError(ctx, err, "Failed to republish resource slices")
+			return
+		}
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+	err := watch.Err()
+	if err == nil {
+		err = errors.New("device watch stopped unexpectedly")
+	}
+	d.HandleError(ctx, err, "Device watch stopped; the driver can no longer track topology changes")
 }
 
 // Shutdown stops the kubelet plugin helper and the healthcheck server.
