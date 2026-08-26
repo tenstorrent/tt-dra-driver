@@ -318,10 +318,14 @@ func TestSmokeFailsWhenTheAgentNeverFinishesDiscovery(t *testing.T) {
 }
 
 // TestSmokeFailsWhenTheAgentIsUnreachable covers a down or misaddressed agent.
-// Because grpc.NewClient connects lazily, this is the first call that notices,
-// and the failure has to be loud: the kubelet probe failing and the driver
-// crashlooping is the intended outcome.
+// Because grpc.NewClient connects lazily, this is the first call that notices.
+// An unreachable agent is retried — it may just be starting — but once the
+// budget is exhausted the failure has to be loud: the kubelet probe failing
+// and the driver crashlooping is the intended outcome.
 func TestSmokeFailsWhenTheAgentIsUnreachable(t *testing.T) {
+	// Exhaust the retry budget in milliseconds rather than minutes.
+	withFastBackoff(t, 3)
+
 	// A port nothing listens on: taken and released, so it is free.
 	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t)))
 
