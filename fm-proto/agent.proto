@@ -21,7 +21,30 @@ service AgentService {
     // that UMD is never invoked from two threads simultaneously.
     rpc RediscoverTopology (RediscoverTopologyRequest) returns (RediscoverTopologyResponse) {}
 
+    // Return the topology currently cached on the agent, without re-running
+    // discovery. This is a point-in-time snapshot; use WatchTopology to track
+    // the state as it changes.
     rpc GetTopology (GetTopologyRequest) returns (GetTopologyResponse) {}
+
+    // Watch the agent's discovered topology. The agent writes one message
+    // immediately, carrying the state as of the moment the client connected
+    // (including TOPOLOGY_NOT_DISCOVERED when no discovery has completed yet),
+    // and then one message every time that state changes — after a
+    // RediscoverTopology call, or after a rediscovery the agent triggered
+    // itself in response to telemetry-observed link changes.
+    //
+    // Every message is a complete snapshot rather than a delta, so a client
+    // only ever needs to keep the newest one it received, and a client that
+    // reconnects is fully re-synchronised by the first message of the new
+    // stream. Rediscoveries that leave the topology byte-identical are not
+    // re-sent, so receiving a message always means something actually changed.
+    //
+    // The stream stays open until the client cancels it or the agent shuts
+    // down (UNAVAILABLE). Because the agent serves this on a synchronous gRPC
+    // server, each open watch occupies a server thread; the agent therefore
+    // caps how many may be open at once and rejects further ones with
+    // RESOURCE_EXHAUSTED.
+    rpc WatchTopology (WatchTopologyRequest) returns (stream WatchTopologyResponse) {}
 
     // Re-train (re-initialise) one or more ethernet links on this host. The
     // agent dispatches each link to the tt-ethtool library, which:
@@ -102,6 +125,29 @@ message GetTopologyResponse {
     GetTopologyStatus status = 1;
     fabricmanager.topology.HostPhysicalTopology physical_topology = 2;
     string cluster_descriptor_yaml = 3;
+}
+
+message WatchTopologyRequest {
+    // Reserved for future expansion (e.g. a resume-from version so a
+    // reconnecting client can skip the initial snapshot). Kept empty for now
+    // so that the schema is forward-compatible.
+}
+
+// One snapshot of the agent's topology state, as streamed by WatchTopology.
+// The status / topology / YAML fields carry exactly what a GetTopology call
+// made at that instant would have returned.
+message WatchTopologyResponse {
+    GetTopologyStatus status = 1;
+    fabricmanager.topology.HostPhysicalTopology physical_topology = 2;
+    string cluster_descriptor_yaml = 3;
+
+    // Generation counter of the agent's topology state, incremented every
+    // time the agent installs a discovery result. It is strictly increasing
+    // within a stream but not contiguous: rediscoveries that did not change
+    // the topology bump it without producing a message. It resets when the
+    // agent restarts, so it is only meaningful for ordering messages within
+    // one stream, not for comparing across connections.
+    uint64 version = 4;
 }
 
 // Identifies a single link to retrain plus the architecture-specific

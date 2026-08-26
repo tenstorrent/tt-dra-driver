@@ -17,6 +17,18 @@ message HostPhysicalTopology {
 
   // Exit node connections (to ASICs on other hosts).
   repeated ExitNodeInfo exit_nodes = 3;
+
+  // Host-level fabric topology quirks (e.g. BH galaxy rev c vs rev b)
+  HostTopologyQuirks quirks = 4;
+
+  // Discovery method
+  HostTopologyDiscoveryMethod discovery_method = 5;
+
+  // Non-empty when device discovery detected an error that prevented a usable
+  // topology from being built (e.g. the sysfs fallback validation failed). When
+  // set, the ASIC/connection lists above are empty and the host is registered
+  // with no topology; this field carries the human-readable reason(s).
+  string discovery_error = 6;
 }
 
 // Information about a single ASIC.
@@ -48,4 +60,15 @@ message ExitNodeInfo {
   uint32 local_channel = 2;     // Ethernet channel on local ASIC
   uint64 remote_asic_id = 3;    // ASIC unique ID on remote host
   uint32 remote_channel = 4;    // Ethernet channel on remote ASIC
+}
+
+// Host-level fabric topology quirks (e.g. BH galaxy rev c vs rev b)
+message HostTopologyQuirks {
+  bool is_bh_glx_rev_c = 1; // Indicates that the system has BH galaxy rev c tray layout
+}
+
+enum HostTopologyDiscoveryMethod {
+  DISCOVERY_METHOD_UNKNOWN = 0;
+  DISCOVERY_METHOD_UMD = 1;      // Topology discovered via TT UMD
+  DISCOVERY_METHOD_FALLBACK = 2; // Topology discovered using fallback method (sysfs)
 }

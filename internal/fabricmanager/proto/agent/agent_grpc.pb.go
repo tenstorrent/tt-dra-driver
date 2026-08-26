@@ -22,6 +22,7 @@ const (
 	AgentService_Ping_FullMethodName               = "/fabricmanager.agent.AgentService/Ping"
 	AgentService_RediscoverTopology_FullMethodName = "/fabricmanager.agent.AgentService/RediscoverTopology"
 	AgentService_GetTopology_FullMethodName        = "/fabricmanager.agent.AgentService/GetTopology"
+	AgentService_WatchTopology_FullMethodName      = "/fabricmanager.agent.AgentService/WatchTopology"
 	AgentService_RetrainLinks_FullMethodName       = "/fabricmanager.agent.AgentService/RetrainLinks"
 )
 
@@ -44,7 +45,29 @@ type AgentServiceClient interface {
 	// rediscoveries and rejects concurrent ones with ALREADY_IN_PROGRESS so
 	// that UMD is never invoked from two threads simultaneously.
 	RediscoverTopology(ctx context.Context, in *RediscoverTopologyRequest, opts ...grpc.CallOption) (*RediscoverTopologyResponse, error)
+	// Return the topology currently cached on the agent, without re-running
+	// discovery. This is a point-in-time snapshot; use WatchTopology to track
+	// the state as it changes.
 	GetTopology(ctx context.Context, in *GetTopologyRequest, opts ...grpc.CallOption) (*GetTopologyResponse, error)
+	// Watch the agent's discovered topology. The agent writes one message
+	// immediately, carrying the state as of the moment the client connected
+	// (including TOPOLOGY_NOT_DISCOVERED when no discovery has completed yet),
+	// and then one message every time that state changes — after a
+	// RediscoverTopology call, or after a rediscovery the agent triggered
+	// itself in response to telemetry-observed link changes.
+	//
+	// Every message is a complete snapshot rather than a delta, so a client
+	// only ever needs to keep the newest one it received, and a client that
+	// reconnects is fully re-synchronised by the first message of the new
+	// stream. Rediscoveries that leave the topology byte-identical are not
+	// re-sent, so receiving a message always means something actually changed.
+	//
+	// The stream stays open until the client cancels it or the agent shuts
+	// down (UNAVAILABLE). Because the agent serves this on a synchronous gRPC
+	// server, each open watch occupies a server thread; the agent therefore
+	// caps how many may be open at once and rejects further ones with
+	// RESOURCE_EXHAUSTED.
+	WatchTopology(ctx context.Context, in *WatchTopologyRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchTopologyResponse], error)
 	// Re-train (re-initialise) one or more ethernet links on this host. The
 	// agent dispatches each link to the tt-ethtool library, which:
 	//   - On Wormhole, writes the SerDes-retrain trigger via the ETH FW
@@ -106,6 +129,25 @@ func (c *agentServiceClient) GetTopology(ctx context.Context, in *GetTopologyReq
 	return out, nil
 }
 
+func (c *agentServiceClient) WatchTopology(ctx context.Context, in *WatchTopologyRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[WatchTopologyResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &AgentService_ServiceDesc.Streams[0], AgentService_WatchTopology_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchTopologyRequest, WatchTopologyResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_WatchTopologyClient = grpc.ServerStreamingClient[WatchTopologyResponse]
+
 func (c *agentServiceClient) RetrainLinks(ctx context.Context, in *RetrainLinksRequest, opts ...grpc.CallOption) (*RetrainLinksResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RetrainLinksResponse)
@@ -135,7 +177,29 @@ type AgentServiceServer interface {
 	// rediscoveries and rejects concurrent ones with ALREADY_IN_PROGRESS so
 	// that UMD is never invoked from two threads simultaneously.
 	RediscoverTopology(context.Context, *RediscoverTopologyRequest) (*RediscoverTopologyResponse, error)
+	// Return the topology currently cached on the agent, without re-running
+	// discovery. This is a point-in-time snapshot; use WatchTopology to track
+	// the state as it changes.
 	GetTopology(context.Context, *GetTopologyRequest) (*GetTopologyResponse, error)
+	// Watch the agent's discovered topology. The agent writes one message
+	// immediately, carrying the state as of the moment the client connected
+	// (including TOPOLOGY_NOT_DISCOVERED when no discovery has completed yet),
+	// and then one message every time that state changes — after a
+	// RediscoverTopology call, or after a rediscovery the agent triggered
+	// itself in response to telemetry-observed link changes.
+	//
+	// Every message is a complete snapshot rather than a delta, so a client
+	// only ever needs to keep the newest one it received, and a client that
+	// reconnects is fully re-synchronised by the first message of the new
+	// stream. Rediscoveries that leave the topology byte-identical are not
+	// re-sent, so receiving a message always means something actually changed.
+	//
+	// The stream stays open until the client cancels it or the agent shuts
+	// down (UNAVAILABLE). Because the agent serves this on a synchronous gRPC
+	// server, each open watch occupies a server thread; the agent therefore
+	// caps how many may be open at once and rejects further ones with
+	// RESOURCE_EXHAUSTED.
+	WatchTopology(*WatchTopologyRequest, grpc.ServerStreamingServer[WatchTopologyResponse]) error
 	// Re-train (re-initialise) one or more ethernet links on this host. The
 	// agent dispatches each link to the tt-ethtool library, which:
 	//   - On Wormhole, writes the SerDes-retrain trigger via the ETH FW
@@ -175,6 +239,9 @@ func (UnimplementedAgentServiceServer) RediscoverTopology(context.Context, *Redi
 }
 func (UnimplementedAgentServiceServer) GetTopology(context.Context, *GetTopologyRequest) (*GetTopologyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTopology not implemented")
+}
+func (UnimplementedAgentServiceServer) WatchTopology(*WatchTopologyRequest, grpc.ServerStreamingServer[WatchTopologyResponse]) error {
+	return status.Error(codes.Unimplemented, "method WatchTopology not implemented")
 }
 func (UnimplementedAgentServiceServer) RetrainLinks(context.Context, *RetrainLinksRequest) (*RetrainLinksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RetrainLinks not implemented")
@@ -254,6 +321,17 @@ func _AgentService_GetTopology_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _AgentService_WatchTopology_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchTopologyRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AgentServiceServer).WatchTopology(m, &grpc.GenericServerStream[WatchTopologyRequest, WatchTopologyResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type AgentService_WatchTopologyServer = grpc.ServerStreamingServer[WatchTopologyResponse]
+
 func _AgentService_RetrainLinks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RetrainLinksRequest)
 	if err := dec(in); err != nil {
@@ -296,6 +374,12 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _AgentService_RetrainLinks_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchTopology",
+			Handler:       _AgentService_WatchTopology_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "agent.proto",
 }
