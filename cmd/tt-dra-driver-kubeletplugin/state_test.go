@@ -21,21 +21,25 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdispec "tags.cncf.io/container-device-interface/specs-go"
 
+	"github.com/tenstorrent/tt-dra-driver/internal/fabricmanager"
 	"github.com/tenstorrent/tt-dra-driver/internal/profiles"
 )
 
@@ -431,5 +435,110 @@ func TestUnprepareToleratesMissingClaimSpecFile(t *testing.T) {
 
 	if err := state.Unprepare(context.Background(), "claim-uid"); err != nil {
 		t.Errorf("Unprepare with the spec file already gone: %v", err)
+	}
+}
+
+// scriptedProfile returns a scripted sequence of EnumerateDevices results,
+// repeating the last one once the script is exhausted.
+type scriptedProfile struct {
+	profiles.NoopConfigHandler
+
+	errs  []error
+	calls int
+}
+
+func (p *scriptedProfile) EnumerateDevices(context.Context) (resourceslice.DriverResources, error) {
+	p.calls++
+	err := p.errs[min(p.calls, len(p.errs))-1]
+	if err != nil {
+		return resourceslice.DriverResources{}, err
+	}
+	return resourceslice.DriverResources{
+		Pools: map[string]resourceslice.Pool{"node": {}},
+	}, nil
+}
+
+func (p *scriptedProfile) CommonContainerEdits() *cdiapi.ContainerEdits { return nil }
+
+// withFastBackoff shrinks the retry budget so the tests exercise the retry
+// logic without sleeping for minutes.
+func withFastBackoff(t *testing.T, steps int) {
+	t.Helper()
+	original := enumerateBackoff
+	enumerateBackoff = wait.Backoff{
+		Duration: time.Millisecond,
+		Factor:   1.0,
+		Steps:    steps,
+	}
+	t.Cleanup(func() { enumerateBackoff = original })
+}
+
+func TestEnumerateDevicesWithRetry(t *testing.T) {
+	// The wrapping mirrors what the tenstorrent profile does to errors from
+	// the agent client, so the sentinels have to survive %w to be seen here.
+	notReady := fmt.Errorf("tenstorrent profile: get topology: %w", fabricmanager.ErrTopologyNotReady)
+	unavailable := fmt.Errorf("tenstorrent profile: get topology: %w", fabricmanager.ErrAgentUnavailable)
+	permanent := errors.New("tenstorrent profile: malformed topology")
+
+	for _, tc := range []struct {
+		name      string
+		errs      []error
+		wantErr   error
+		wantCalls int
+	}{
+		{
+			name:      "succeeds on first attempt",
+			errs:      []error{nil},
+			wantCalls: 1,
+		},
+		{
+			name:      "waits out topology discovery",
+			errs:      []error{notReady, notReady, nil},
+			wantCalls: 3,
+		},
+		{
+			name:      "waits out an agent that is not answering",
+			errs:      []error{unavailable, unavailable, nil},
+			wantCalls: 3,
+		},
+		{
+			name:      "waits out a mix of transient failures",
+			errs:      []error{unavailable, notReady, nil},
+			wantCalls: 3,
+		},
+		{
+			name:      "gives up on a permanent error without retrying",
+			errs:      []error{permanent},
+			wantErr:   permanent,
+			wantCalls: 1,
+		},
+		{
+			name:      "surfaces the transient error once the budget is exhausted",
+			errs:      []error{unavailable},
+			wantErr:   fabricmanager.ErrAgentUnavailable,
+			wantCalls: 4,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withFastBackoff(t, tc.wantCalls)
+			profile := &scriptedProfile{errs: tc.errs}
+
+			resources, err := enumerateDevicesWithRetry(context.Background(), profile)
+
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("enumerateDevicesWithRetry: unexpected error: %v", err)
+				}
+				if _, ok := resources.Pools["node"]; !ok {
+					t.Errorf("enumerateDevicesWithRetry returned %v, want the profile's pools", resources.Pools)
+				}
+			} else if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("enumerateDevicesWithRetry returned %v, want %v", err, tc.wantErr)
+			}
+
+			if profile.calls != tc.wantCalls {
+				t.Errorf("EnumerateDevices was called %d times, want %d", profile.calls, tc.wantCalls)
+			}
+		})
 	}
 }
