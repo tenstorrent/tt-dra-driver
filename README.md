@@ -11,10 +11,12 @@ practices established by the upstream
 [`kubernetes-sigs/dra-example-driver`][example-driver].
 
 The driver does not probe hardware itself. Its kubelet plugin runs as a
-DaemonSet and calls the `GetTopology` remote procedure call (RPC) of the
-[Tenstorrent Fabric Manager (TTFM)][ttfm] agent on the same node to discover
-the application-specific integrated circuits (ASICs) present, then publishes
-one device per ASIC that has a memory-mapped I/O (MMIO) path to the host.
+DaemonSet and watches the `WatchTopology` remote procedure call (RPC) stream
+of the [Tenstorrent Fabric Manager (TTFM)][ttfm] agent on the same node to
+discover the application-specific integrated circuits (ASICs) present, then
+publishes one device per ASIC that has a memory-mapped I/O (MMIO) path to the
+host. Because it watches rather than queries once, the published
+`ResourceSlice` set follows the agent's topology as it changes.
 Remote ASICs reachable only through another chip on the same tray are grouped
 under their MMIO-capable parent. Each allocated device receives a CDI edit
 that exposes its `/dev/tenstorrent/<N>` node, and a driver-wide CDI spec

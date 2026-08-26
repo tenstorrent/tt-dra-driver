@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,26 +34,63 @@ import (
 	topologypb "github.com/tenstorrent/tt-dra-driver/internal/fabricmanager/proto/topology"
 )
 
-// fakeAgent serves GetTopology from a canned response, error or handler.
+// recvTimeout bounds how long a test waits for a snapshot that should
+// already be on its way. It only has to be longer than the in-memory
+// round-trip; a regression that stalls the watch fails the test instead of
+// hanging the suite.
+const recvTimeout = 10 * time.Second
+
+// watchAttempt scripts what the fake agent does the nth time a client opens
+// a watch, which is how the reconnect paths get exercised.
+type watchAttempt struct {
+	// err fails the stream immediately with this error.
+	err error
+	// msgs are sent in order before hold/EOF is applied.
+	msgs []*agentpb.WatchTopologyResponse
+	// hold keeps the stream open (and silent) after msgs until the client
+	// goes away, which is what a healthy idle watch looks like.
+	hold bool
+}
+
+// fakeAgent serves WatchTopology from a script. The last entry repeats once
+// the script runs out, so a trailing {hold: true} means "stay connected and
+// quiet from now on".
 type fakeAgent struct {
 	agentpb.UnimplementedAgentServiceServer
 
-	resp   *agentpb.GetTopologyResponse
-	err    error
-	block  bool          // never answer, until the call's context is done
-	served chan struct{} // closed on first GetTopology, if non-nil
+	script []watchAttempt
+
+	mu       sync.Mutex
+	attempts int
 }
 
-func (f *fakeAgent) GetTopology(ctx context.Context, _ *agentpb.GetTopologyRequest) (*agentpb.GetTopologyResponse, error) {
-	if f.served != nil {
-		close(f.served)
-		f.served = nil
+func (f *fakeAgent) WatchTopology(_ *agentpb.WatchTopologyRequest, stream grpc.ServerStreamingServer[agentpb.WatchTopologyResponse]) error {
+	f.mu.Lock()
+	n := f.attempts
+	f.attempts++
+	f.mu.Unlock()
+
+	attempt := f.script[min(n, len(f.script)-1)]
+
+	if attempt.err != nil {
+		return attempt.err
 	}
-	if f.block {
-		<-ctx.Done()
-		return nil, ctx.Err()
+	for _, msg := range attempt.msgs {
+		if err := stream.Send(msg); err != nil {
+			return err
+		}
 	}
-	return f.resp, f.err
+	if attempt.hold {
+		<-stream.Context().Done()
+		return stream.Context().Err()
+	}
+	return nil
+}
+
+func (f *fakeAgent) attemptCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.attempts
 }
 
 // startFakeAgent runs agent on an in-memory listener and returns a client
@@ -64,8 +102,6 @@ func startFakeAgent(t *testing.T, agent *fakeAgent, opts ...ClientOption) *Agent
 	server := grpc.NewServer()
 	agentpb.RegisterAgentServiceServer(server, agent)
 	go func() {
-		// Serve returns ErrServerStopped-free on GracefulStop; anything else
-		// surfaces as a failing RPC in the test body.
 		_ = server.Serve(lis)
 	}()
 
@@ -88,151 +124,280 @@ func startFakeAgent(t *testing.T, agent *fakeAgent, opts ...ClientOption) *Agent
 	return client
 }
 
-func TestGetTopologyOK(t *testing.T) {
-	want := &topologypb.HostPhysicalTopology{
-		Asics: []*topologypb.AsicInfo{{UniqueId: 42, IsMmioCapable: true}},
-	}
-	client := startFakeAgent(t, &fakeAgent{
-		resp: &agentpb.GetTopologyResponse{
-			Status:           agentpb.GetTopologyStatus_TOPOLOGY_OK,
-			PhysicalTopology: want,
+// fastReconnect keeps the reconnect paths quick enough to test.
+func fastReconnect() ClientOption {
+	return WithReconnectBackoff(time.Millisecond, 2*time.Millisecond)
+}
+
+func okMsg(uniqueID, version uint64) *agentpb.WatchTopologyResponse {
+	return &agentpb.WatchTopologyResponse{
+		Status:  agentpb.GetTopologyStatus_TOPOLOGY_OK,
+		Version: version,
+		PhysicalTopology: &topologypb.HostPhysicalTopology{
+			Asics: []*topologypb.AsicInfo{{UniqueId: uniqueID, IsMmioCapable: true}},
 		},
-	})
-
-	got, err := client.GetTopology(context.Background())
-	if err != nil {
-		t.Fatalf("GetTopology: unexpected error: %v", err)
-	}
-	if len(got.GetAsics()) != 1 || got.GetAsics()[0].GetUniqueId() != 42 {
-		t.Errorf("GetTopology returned %v, want the single ASIC with unique id 42", got.GetAsics())
 	}
 }
 
-func TestGetTopologyNotDiscovered(t *testing.T) {
-	client := startFakeAgent(t, &fakeAgent{
-		resp: &agentpb.GetTopologyResponse{
-			Status: agentpb.GetTopologyStatus_TOPOLOGY_NOT_DISCOVERED,
+func notDiscoveredMsg(version uint64) *agentpb.WatchTopologyResponse {
+	return &agentpb.WatchTopologyResponse{
+		Status:  agentpb.GetTopologyStatus_TOPOLOGY_NOT_DISCOVERED,
+		Version: version,
+	}
+}
+
+func discoveryErrorMsg(reason string, version uint64) *agentpb.WatchTopologyResponse {
+	return &agentpb.WatchTopologyResponse{
+		Status:  agentpb.GetTopologyStatus_TOPOLOGY_OK,
+		Version: version,
+		PhysicalTopology: &topologypb.HostPhysicalTopology{
+			DiscoveryError: reason,
 		},
-	})
-
-	_, err := client.GetTopology(context.Background())
-	if !errors.Is(err, ErrTopologyNotReady) {
-		t.Errorf("GetTopology returned %v, want ErrTopologyNotReady", err)
-	}
-	if errors.Is(err, ErrAgentUnavailable) {
-		t.Errorf("GetTopology returned %v, which must not be ErrAgentUnavailable: the agent did answer", err)
 	}
 }
 
-// TestGetTopologyUnavailable covers the agent being down or restarting: the
-// RPC fails with codes.Unavailable and must be reported as transient so the
-// caller retries instead of exiting.
-func TestGetTopologyUnavailable(t *testing.T) {
-	client := startFakeAgent(t, &fakeAgent{
-		err: status.Error(codes.Unavailable, "agent restarting"),
-	})
-
-	_, err := client.GetTopology(context.Background())
-	if !errors.Is(err, ErrAgentUnavailable) {
-		t.Fatalf("GetTopology returned %v, want ErrAgentUnavailable", err)
-	}
-	if code := status.Code(err); code != codes.Unavailable {
-		t.Errorf("wrapped error has code %v, want Unavailable to stay inspectable", code)
-	}
-}
-
-// TestGetTopologyWedgedAgent is the case the per-call deadline exists for: a
-// reachable agent that accepts the call and never answers must not block the
-// caller indefinitely.
-func TestGetTopologyWedgedAgent(t *testing.T) {
-	client := startFakeAgent(t,
-		&fakeAgent{block: true},
-		WithRPCTimeout(100*time.Millisecond),
-	)
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := client.GetTopology(context.Background())
-		done <- err
-	}()
-
+// recvSnapshot returns the next snapshot, failing the test if the watch
+// closes or goes quiet instead.
+func recvSnapshot(t *testing.T, watch TopologyWatch) Snapshot {
+	t.Helper()
 	select {
-	case err := <-done:
-		if !errors.Is(err, ErrAgentUnavailable) {
-			t.Errorf("GetTopology returned %v, want ErrAgentUnavailable", err)
+	case snapshot, ok := <-watch.Updates():
+		if !ok {
+			t.Fatalf("watch closed while a snapshot was expected: %v", watch.Err())
 		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("GetTopology did not return: the per-call deadline is not being applied")
+		return snapshot
+	case <-time.After(recvTimeout):
+		t.Fatal("timed out waiting for a snapshot")
+		return Snapshot{}
 	}
 }
 
-// TestGetTopologyCallerContextDone checks that a failure owned by the caller
-// (shutdown, or a caller-chosen deadline) is not reported as a transient
-// agent problem, so the retry loop above does not keep sleeping while the
-// plugin is trying to exit.
-func TestGetTopologyCallerContextDone(t *testing.T) {
-	client := startFakeAgent(t, &fakeAgent{
-		block:  true,
-		served: make(chan struct{}),
-	})
+// awaitClosed drains the watch and returns the error it stopped with.
+func awaitClosed(t *testing.T, watch TopologyWatch) error {
+	t.Helper()
+	for {
+		select {
+		case _, ok := <-watch.Updates():
+			if !ok {
+				return watch.Err()
+			}
+		case <-time.After(recvTimeout):
+			t.Fatal("timed out waiting for the watch to stop")
+			return nil
+		}
+	}
+}
+
+// TestWatchTopologyDeliversInitialAndChangedSnapshots covers the happy path:
+// the snapshot the agent sends on connect, followed by one per change.
+func TestWatchTopologyDeliversInitialAndChangedSnapshots(t *testing.T) {
+	client := startFakeAgent(t, &fakeAgent{script: []watchAttempt{{
+		msgs: []*agentpb.WatchTopologyResponse{okMsg(1, 7), okMsg(2, 8)},
+		hold: true,
+	}}})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
+	watch := client.WatchTopology(ctx)
 
-	_, err := client.GetTopology(ctx)
-	if err == nil {
-		t.Fatal("GetTopology succeeded on a cancelled context, want an error")
+	first := recvSnapshot(t, watch)
+	if !first.Usable() {
+		t.Fatalf("first snapshot is not usable: %+v", first)
 	}
-	if errors.Is(err, ErrAgentUnavailable) {
-		t.Errorf("GetTopology returned %v; a cancelled caller context must not be reported as ErrAgentUnavailable", err)
+	if got := first.Topology.GetAsics()[0].GetUniqueId(); got != 1 {
+		t.Errorf("first snapshot has ASIC %d, want 1", got)
+	}
+	if first.Version != 7 {
+		t.Errorf("first snapshot has version %d, want 7", first.Version)
+	}
+
+	second := recvSnapshot(t, watch)
+	if got := second.Topology.GetAsics()[0].GetUniqueId(); got != 2 {
+		t.Errorf("second snapshot has ASIC %d, want 2", got)
 	}
 }
 
-// TestGetTopologyPermanentError checks that errors which retrying cannot fix
-// are surfaced immediately rather than wrapped as transient.
-func TestGetTopologyPermanentError(t *testing.T) {
+// TestWatchTopologyNotUsableSnapshots checks that states carrying no
+// topology are still delivered — the consumer needs to know the agent is
+// alive — but are marked so it does not mistake them for an empty host.
+func TestWatchTopologyNotUsableSnapshots(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		agent *fakeAgent
+		name               string
+		msg                *agentpb.WatchTopologyResponse
+		wantDiscoveryError string
 	}{
 		{
-			name:  "rpc error",
-			agent: &fakeAgent{err: status.Error(codes.Internal, "boom")},
+			name: "discovery not finished",
+			msg:  notDiscoveredMsg(1),
 		},
 		{
-			// A status this client does not know about, e.g. one added to
-			// the agent's proto after this build.
-			name: "unexpected status",
-			agent: &fakeAgent{resp: &agentpb.GetTopologyResponse{
-				Status: agentpb.GetTopologyStatus(99),
-			}},
+			name:               "discovery failed",
+			msg:                discoveryErrorMsg("sysfs fallback validation failed", 2),
+			wantDiscoveryError: "sysfs fallback validation failed",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			client := startFakeAgent(t, tc.agent)
+			client := startFakeAgent(t, &fakeAgent{script: []watchAttempt{{
+				msgs: []*agentpb.WatchTopologyResponse{tc.msg},
+				hold: true,
+			}}})
 
-			_, err := client.GetTopology(context.Background())
-			if err == nil {
-				t.Fatal("GetTopology succeeded, want an error")
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			snapshot := recvSnapshot(t, client.WatchTopology(ctx))
+			if snapshot.Usable() {
+				t.Errorf("snapshot %+v reports itself usable", snapshot)
 			}
-			if errors.Is(err, ErrAgentUnavailable) || errors.Is(err, ErrTopologyNotReady) {
-				t.Errorf("GetTopology returned %v, want a non-transient error", err)
+			if got := snapshot.DiscoveryError(); got != tc.wantDiscoveryError {
+				t.Errorf("DiscoveryError is %q, want %q", got, tc.wantDiscoveryError)
 			}
 		})
 	}
 }
 
-// TestDialDoesNotBlockOnUnreachableAgent documents that Dial succeeds even
-// when nothing is listening: unreachability shows up on the first RPC.
-func TestDialDoesNotBlockOnUnreachableAgent(t *testing.T) {
+// TestWatchTopologyReconnects covers the failures that a watch must ride out
+// on its own rather than surfacing to the driver.
+func TestWatchTopologyReconnects(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		first watchAttempt
+		opts  []ClientOption
+	}{
+		{
+			name:  "agent is down",
+			first: watchAttempt{err: status.Error(codes.Unavailable, "agent restarting")},
+		},
+		{
+			name:  "agent is out of watch slots",
+			first: watchAttempt{err: status.Error(codes.ResourceExhausted, "too many watches")},
+		},
+		{
+			name:  "agent ends the stream cleanly",
+			first: watchAttempt{},
+		},
+		{
+			// The wedged-agent case: the stream is accepted but the promised
+			// initial snapshot never arrives.
+			name:  "agent accepts the watch and goes quiet",
+			first: watchAttempt{hold: true},
+			opts:  []ClientOption{WithFirstSnapshotTimeout(100 * time.Millisecond)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &fakeAgent{script: []watchAttempt{
+				tc.first,
+				{msgs: []*agentpb.WatchTopologyResponse{okMsg(42, 1)}, hold: true},
+			}}
+			client := startFakeAgent(t, agent, append([]ClientOption{fastReconnect()}, tc.opts...)...)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			watch := client.WatchTopology(ctx)
+
+			snapshot := recvSnapshot(t, watch)
+			if got := snapshot.Topology.GetAsics()[0].GetUniqueId(); got != 42 {
+				t.Errorf("snapshot has ASIC %d, want 42 from the second attempt", got)
+			}
+			// Receiving the second attempt's snapshot is itself the proof
+			// that the watch reconnected instead of giving up; Err is only
+			// readable once the watch has stopped.
+			if attempts := agent.attemptCount(); attempts < 2 {
+				t.Errorf("agent saw %d watch attempts, want at least 2 (a reconnect)", attempts)
+			}
+		})
+	}
+}
+
+// TestWatchTopologyUnsupportedAgent covers an agent too old to serve the
+// streaming API: reconnecting cannot fix it, so the watch has to stop and
+// say why.
+func TestWatchTopologyUnsupportedAgent(t *testing.T) {
+	agent := &fakeAgent{script: []watchAttempt{{
+		err: status.Error(codes.Unimplemented, "unknown method WatchTopology"),
+	}}}
+	client := startFakeAgent(t, agent, fastReconnect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := awaitClosed(t, client.WatchTopology(ctx))
+	if !errors.Is(err, ErrWatchUnsupported) {
+		t.Errorf("watch stopped with %v, want ErrWatchUnsupported", err)
+	}
+	if attempts := agent.attemptCount(); attempts != 1 {
+		t.Errorf("agent saw %d watch attempts, want exactly 1: a permanent failure must not be retried", attempts)
+	}
+}
+
+// TestWatchTopologyPermanentError checks that an error retrying cannot fix
+// stops the watch instead of spinning forever.
+func TestWatchTopologyPermanentError(t *testing.T) {
+	client := startFakeAgent(t, &fakeAgent{script: []watchAttempt{{
+		err: status.Error(codes.Internal, "boom"),
+	}}}, fastReconnect())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := awaitClosed(t, client.WatchTopology(ctx))
+	if err == nil {
+		t.Fatal("watch stopped without an error, want the agent's failure")
+	}
+	if code := status.Code(err); code != codes.Internal {
+		t.Errorf("watch stopped with code %v, want Internal to stay inspectable", code)
+	}
+}
+
+// TestWatchTopologyStopsOnContextCancel checks the shutdown path: cancelling
+// the context is a clean stop, not a failure.
+func TestWatchTopologyStopsOnContextCancel(t *testing.T) {
+	client := startFakeAgent(t, &fakeAgent{script: []watchAttempt{{
+		msgs: []*agentpb.WatchTopologyResponse{okMsg(1, 1)},
+		hold: true,
+	}}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	watch := client.WatchTopology(ctx)
+	recvSnapshot(t, watch)
+	cancel()
+
+	if err := awaitClosed(t, watch); err != nil {
+		t.Errorf("watch stopped with %v, want nil after its context was cancelled", err)
+	}
+}
+
+// TestWatchTopologyUnreachableAgent documents that a lazily-connected client
+// keeps retrying an agent that is not listening yet, rather than failing.
+func TestWatchTopologyUnreachableAgent(t *testing.T) {
 	client, err := Dial("127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("Dial: unexpected error: %v", err)
 	}
 	t.Cleanup(func() { _ = client.Close() })
 
-	_, err = client.GetTopology(context.Background())
-	if !errors.Is(err, ErrAgentUnavailable) {
-		t.Errorf("GetTopology against an unreachable agent returned %v, want ErrAgentUnavailable", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	// No snapshot can arrive, and the watch must keep trying until its
+	// context expires instead of reporting a permanent failure.
+	if err := awaitClosed(t, client.WatchTopology(ctx)); err != nil {
+		t.Errorf("watch stopped with %v, want nil: an unreachable agent is a transient condition", err)
+	}
+}
+
+func TestReconnectBackoff(t *testing.T) {
+	b := &reconnectBackoff{initial: time.Second, max: 4 * time.Second}
+
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 4 * time.Second}
+	for i, expected := range want {
+		if got := b.next(); got != expected {
+			t.Errorf("delay %d is %v, want %v", i, got, expected)
+		}
+	}
+
+	b.reset()
+	if got := b.next(); got != time.Second {
+		t.Errorf("delay after reset is %v, want the initial %v", got, time.Second)
 	}
 }

@@ -23,7 +23,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -31,32 +30,16 @@ import (
 	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer/json"
-	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/util/retry"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
 	drapbv1 "k8s.io/kubelet/pkg/apis/dra/v1beta1"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 
-	"github.com/tenstorrent/tt-dra-driver/internal/fabricmanager"
 	"github.com/tenstorrent/tt-dra-driver/internal/profiles"
 )
-
-// enumerateBackoff bounds how long NewDeviceState waits for the fabric
-// manager agent to become usable before failing the driver probe. With
-// Factor=1.5, Cap=30s, Steps=20 the sleeps alone cap out at roughly five
-// minutes of wall time, which comfortably covers observed FM agent startup
-// latencies. Each attempt also carries the client's per-call deadline
-// (fabricmanager.DefaultRPCTimeout), so a wedged agent adds at most a
-// further Steps*timeout on top instead of blocking forever.
-var enumerateBackoff = wait.Backoff{
-	Duration: 1 * time.Second,
-	Factor:   1.5,
-	Steps:    20,
-	Cap:      30 * time.Second,
-}
 
 // AllocatableDevices is a map of device name to its full descriptor for
 // quick lookup during Prepare.
@@ -79,6 +62,7 @@ type DeviceState struct {
 	sync.Mutex
 
 	driverName        string
+	nodeName          string
 	cdi               *CDIHandler
 	driverResources   resourceslice.DriverResources
 	allocatable       AllocatableDevices
@@ -87,15 +71,11 @@ type DeviceState struct {
 	configHandler     profiles.ConfigHandler
 }
 
-// NewDeviceState constructs the DeviceState by enumerating devices from the
-// active profile, initializing the CDI handler and loading any previously
-// persisted checkpoint.
-func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
-	driverResources, err := enumerateDevicesWithRetry(ctx, config.profile)
-	if err != nil {
-		return nil, fmt.Errorf("error enumerating all possible devices: %w", err)
-	}
-
+// NewDeviceState constructs the DeviceState from the first set of resources
+// reported by the active profile's device watch, initializing the CDI
+// handler and loading any previously persisted checkpoint. Later sets are
+// folded in with SetResources.
+func NewDeviceState(ctx context.Context, config *Config, driverResources resourceslice.DriverResources) (*DeviceState, error) {
 	cdi, err := NewCDIHandler(config.flags.cdiRoot, config.flags.driverName, config.flags.profile, config.profile.CommonContainerEdits())
 	if err != nil {
 		return nil, fmt.Errorf("unable to create CDI handler: %v", err)
@@ -126,18 +106,12 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		},
 	)
 
-	allocatable := make(AllocatableDevices)
-	for _, slice := range driverResources.Pools[config.flags.nodeName].Slices {
-		for _, device := range slice.Devices {
-			allocatable[device.Name] = device
-		}
-	}
-
 	state := &DeviceState{
 		driverName:        config.flags.driverName,
+		nodeName:          config.flags.nodeName,
 		cdi:               cdi,
 		driverResources:   driverResources,
-		allocatable:       allocatable,
+		allocatable:       allocatableFrom(driverResources, config.flags.nodeName),
 		checkpointManager: checkpointManager,
 		configDecoder:     decoder,
 		configHandler:     configHandler,
@@ -222,76 +196,6 @@ func (s *DeviceState) reconcileCDISpecs(ctx context.Context) error {
 	return nil
 }
 
-// enumerateDevicesWithRetry calls profile.EnumerateDevices, retrying with
-// exponential backoff while the fabric manager agent is not yet usable:
-// either it has not finished topology discovery
-// (fabricmanager.ErrTopologyNotReady) or it is not answering at all
-// (fabricmanager.ErrAgentUnavailable, e.g. the agent pod is still starting,
-// restarting or wedged). Any other error is returned immediately. The retry
-// budget is bounded by enumerateBackoff; once exhausted the last transient
-// error is surfaced so the kubelet probe fails rather than the driver
-// publishing an empty ResourceSlice.
-func enumerateDevicesWithRetry(ctx context.Context, profile profiles.Profile) (resourceslice.DriverResources, error) {
-	logger := klog.FromContext(ctx)
-	logger.Info("Enumerating devices from the fabric manager agent")
-
-	start := time.Now()
-	attempts := 0
-
-	var driverResources resourceslice.DriverResources
-	err := retry.OnError(
-		enumerateBackoff,
-		transientEnumerateError,
-		func() error {
-			attempts++
-			attemptStart := time.Now()
-
-			var err error
-			driverResources, err = profile.EnumerateDevices(ctx)
-
-			switch {
-			case err == nil:
-			case errors.Is(err, fabricmanager.ErrTopologyNotReady):
-				logger.Info("Fabric manager agent has not finished topology discovery yet; will retry",
-					"attempt", attempts,
-					"attemptDuration", time.Since(attemptStart),
-					"elapsed", time.Since(start),
-				)
-			case errors.Is(err, fabricmanager.ErrAgentUnavailable):
-				logger.Info("Fabric manager agent is not answering; will retry",
-					"attempt", attempts,
-					"attemptDuration", time.Since(attemptStart),
-					"elapsed", time.Since(start),
-					"err", err,
-				)
-			default:
-				// Not retried by the predicate above, but worth the same
-				// timing context: a slow failure here (an unreachable agent
-				// rather than an undiscovered one) is a driver startup that
-				// stalls and then crashloops.
-				logger.Info("Enumerating devices failed with a non-retryable error",
-					"attempt", attempts,
-					"attemptDuration", time.Since(attemptStart),
-					"elapsed", time.Since(start),
-					"err", err,
-				)
-			}
-			return err
-		},
-	)
-	if err != nil {
-		return resourceslice.DriverResources{}, fmt.Errorf("after %d attempt(s) over %s: %w",
-			attempts, time.Since(start).Round(time.Millisecond), err)
-	}
-
-	logger.Info("Enumerated devices from the fabric manager agent",
-		"numDevices", countDevices(driverResources),
-		"attempts", attempts,
-		"duration", time.Since(start),
-	)
-	return driverResources, nil
-}
-
 // countDevices totals the devices across every pool and slice, for logging
 // how much the driver is about to advertise.
 func countDevices(driverResources resourceslice.DriverResources) int {
@@ -304,11 +208,54 @@ func countDevices(driverResources resourceslice.DriverResources) int {
 	return total
 }
 
-// transientEnumerateError reports whether an EnumerateDevices failure is one
-// the driver should wait out rather than exit on.
-func transientEnumerateError(err error) bool {
-	return errors.Is(err, fabricmanager.ErrTopologyNotReady) ||
-		errors.Is(err, fabricmanager.ErrAgentUnavailable)
+// allocatableFrom flattens the devices published for a node into the lookup
+// table Prepare uses.
+func allocatableFrom(driverResources resourceslice.DriverResources, nodeName string) AllocatableDevices {
+	allocatable := make(AllocatableDevices)
+	for _, slice := range driverResources.Pools[nodeName].Slices {
+		for _, device := range slice.Devices {
+			allocatable[device.Name] = device
+		}
+	}
+	return allocatable
+}
+
+// SetResources installs a newly reported set of devices, replacing what
+// Prepare may allocate from. It reports whether anything actually changed,
+// so that the caller can skip republishing identical ResourceSlices: the
+// agent re-sends a full snapshot whenever a watch (re)connects, which for a
+// reconnect usually describes the topology the driver already published.
+//
+// Devices that disappear are only dropped from the allocatable set; claims
+// already prepared against them keep their checkpoint entry and CDI spec, so
+// running workloads are left alone and it is up to the scheduler to react to
+// the device no longer being advertised.
+func (s *DeviceState) SetResources(driverResources resourceslice.DriverResources) bool {
+	s.Lock()
+	defer s.Unlock()
+
+	if apiequality.Semantic.DeepEqual(s.driverResources, driverResources) {
+		return false
+	}
+	s.driverResources = driverResources
+	s.allocatable = allocatableFrom(driverResources, s.nodeName)
+	return true
+}
+
+// Resources returns the set of devices currently published.
+func (s *DeviceState) Resources() resourceslice.DriverResources {
+	s.Lock()
+	defer s.Unlock()
+
+	return s.driverResources
+}
+
+// AllocatableCount returns how many devices Prepare may currently allocate.
+func (s *DeviceState) AllocatableCount() int {
+	s.Lock()
+	defer s.Unlock()
+
+	return len(s.allocatable)
 }
 
 // Prepare reserves devices for a claim, materializes the per-claim CDI spec

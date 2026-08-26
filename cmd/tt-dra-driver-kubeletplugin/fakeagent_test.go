@@ -20,7 +20,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -49,9 +48,15 @@ type fakeAgent struct {
 
 	mu       sync.Mutex
 	topology *topologypb.HostPhysicalTopology
-	notReady int
+	notReady bool
 	rpcErr   error
-	calls    int
+	version  uint64
+	watches  int
+
+	// subs holds one queue per open WatchTopology stream. Every state change
+	// fans a fresh snapshot out to all of them, the way the real agent
+	// re-reports to each watcher.
+	subs map[chan *agentpb.WatchTopologyResponse]struct{}
 }
 
 // startFakeAgent serves the agent API on an unused loopback port for the
@@ -67,6 +72,7 @@ func startFakeAgent(t *testing.T, topology *topologypb.HostPhysicalTopology) *fa
 	agent := &fakeAgent{
 		addr:     listener.Addr().String(),
 		topology: topology,
+		subs:     make(map[chan *agentpb.WatchTopologyResponse]struct{}),
 	}
 
 	server := grpc.NewServer()
@@ -81,51 +87,103 @@ func startFakeAgent(t *testing.T, topology *topologypb.HostPhysicalTopology) *fa
 	return agent
 }
 
-// GetTopology implements the subset of AgentService the driver calls.
-func (a *fakeAgent) GetTopology(context.Context, *agentpb.GetTopologyRequest) (*agentpb.GetTopologyResponse, error) {
+// WatchTopology implements the subset of AgentService the driver calls.
+//
+// Each stream opens with a snapshot of the agent's current state, as the
+// protocol promises, and then carries one more for every change a test makes
+// afterwards.
+func (a *fakeAgent) WatchTopology(_ *agentpb.WatchTopologyRequest, stream agentpb.AgentService_WatchTopologyServer) error {
+	queue, err := a.subscribe()
+	if err != nil {
+		return err
+	}
+	defer a.unsubscribe(queue)
+
+	for {
+		select {
+		case resp := <-queue:
+			if err := stream.Send(resp); err != nil {
+				return err
+			}
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
+}
+
+// subscribe registers a queue for one stream and seeds it with the current
+// state, or reports the failure a test asked every stream to fail with.
+func (a *fakeAgent) subscribe() (chan *agentpb.WatchTopologyResponse, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.calls++
-
+	a.watches++
 	if a.rpcErr != nil {
 		return nil, a.rpcErr
 	}
-	// Report the agent as still discovering for the first notReady calls, so a
-	// test can drive the driver's startup retry loop.
-	if a.notReady > 0 {
-		a.notReady--
-		return &agentpb.GetTopologyResponse{
-			Status: agentpb.GetTopologyStatus_TOPOLOGY_NOT_DISCOVERED,
-		}, nil
-	}
-	return &agentpb.GetTopologyResponse{
-		Status:           agentpb.GetTopologyStatus_TOPOLOGY_OK,
-		PhysicalTopology: a.topology,
-	}, nil
+
+	// Buffered so that a test changing the topology never blocks on a stream
+	// the driver has not drained yet.
+	queue := make(chan *agentpb.WatchTopologyResponse, 16)
+	queue <- a.snapshotLocked()
+	a.subs[queue] = struct{}{}
+	return queue, nil
 }
 
-// setTopology replaces what the agent reports from the next call onwards.
-// Combined with harness.restart this models hardware that changed while the
-// driver was down.
+func (a *fakeAgent) unsubscribe(queue chan *agentpb.WatchTopologyResponse) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	delete(a.subs, queue)
+}
+
+// snapshotLocked renders the agent's current state as one stream message.
+func (a *fakeAgent) snapshotLocked() *agentpb.WatchTopologyResponse {
+	if a.notReady {
+		return &agentpb.WatchTopologyResponse{
+			Status:  agentpb.GetTopologyStatus_TOPOLOGY_NOT_DISCOVERED,
+			Version: a.version,
+		}
+	}
+	return &agentpb.WatchTopologyResponse{
+		Status:           agentpb.GetTopologyStatus_TOPOLOGY_OK,
+		PhysicalTopology: a.topology,
+		Version:          a.version,
+	}
+}
+
+// broadcastLocked fans the current state out to every open stream.
+func (a *fakeAgent) broadcastLocked() {
+	a.version++
+	for queue := range a.subs {
+		queue <- a.snapshotLocked()
+	}
+}
+
+// setTopology replaces what the agent reports, telling every open watch about
+// the change. Combined with harness.restart this models hardware that changed
+// while the driver was down; on a running driver it models a hot-plug.
 func (a *fakeAgent) setTopology(topology *topologypb.HostPhysicalTopology) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	a.topology = topology
+	a.broadcastLocked()
 }
 
-// setNotReady makes the next n calls report TOPOLOGY_NOT_DISCOVERED before the
-// topology is served normally.
-func (a *fakeAgent) setNotReady(n int) {
+// setDiscovering makes the agent report TOPOLOGY_NOT_DISCOVERED, as it does
+// between coming up and finishing its first discovery pass. Clearing it
+// reports the topology normally.
+func (a *fakeAgent) setDiscovering(discovering bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.notReady = n
+	a.notReady = discovering
+	a.broadcastLocked()
 }
 
-// setRPCError makes every call fail at the transport level until it is cleared
-// with nil.
+// setRPCError makes every stream opened from now on fail at the transport
+// level until it is cleared with nil. Streams already open are left alone.
 func (a *fakeAgent) setRPCError(err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -133,12 +191,13 @@ func (a *fakeAgent) setRPCError(err error) {
 	a.rpcErr = err
 }
 
-// callCount reports how many GetTopology calls the agent has served.
-func (a *fakeAgent) callCount() int {
+// watchCount reports how many WatchTopology streams the agent has been asked
+// for, whether or not it served them.
+func (a *fakeAgent) watchCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	return a.calls
+	return a.watches
 }
 
 // Board type enum values as reported by the fabric manager agent, mirroring

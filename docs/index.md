@@ -12,7 +12,11 @@ with a `ResourceClaim`. It is one of the components installed by
 - Kubernetes 1.33 or later with Dynamic Resource Allocation available on the API
   server and kubelet.
 - The [Fabric Manager](https://docs.tenstorrent.com/tt-fabric-manager/) reachable,
-  since the plugin resolves devices from topology before publishing them.
+  since the plugin resolves devices from topology before publishing them. The
+  agent must be recent enough to serve the `WatchTopology` streaming RPC, which
+  the plugin uses to keep its `ResourceSlice` set in step with the agent's
+  topology; against an older agent the plugin fails to start and logs that
+  `WatchTopology` is not implemented.
 
 ## Claim a device
 
@@ -58,6 +62,12 @@ The driver only publishes devices once topology resolves. On a host with no
 staged fabric topology the `ResourceSlice` set can be empty and claims will not
 bind. This is an environment limitation rather than a failure. Allocation
 behavior is maturing.
+
+Once published, the set is kept in step with the agent: the driver watches for
+topology changes and republishes when the devices on the host change. A
+snapshot that reports no usable topology — discovery still running, or a
+discovery error — is ignored rather than treated as an empty host, so a failed
+rediscovery on the agent does not withdraw devices that workloads are using.
 ```
 
 ```{toctree}
