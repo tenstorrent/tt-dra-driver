@@ -10,9 +10,10 @@ upstream [`kubernetes-sigs/dra-example-driver`][example-driver].
 > [!IMPORTANT]
 > This is the early bootstrap of the project. Only the kubelet-plugin
 > skeleton, build system, and Helm chart scaffolding are wired up. The
-> `tenstorrent` profile discovers ASICs by calling the Tenstorrent Fabric
-> Manager (TTFM) agent's `GetTopology` RPC on the same node; per-device CDI
-> container edits are still left to follow-up work.
+> `tenstorrent` profile discovers ASICs by watching the Tenstorrent Fabric
+> Manager (TTFM) agent's `WatchTopology` stream on the same node, so the
+> published `ResourceSlice` set follows the agent's topology as it changes;
+> per-device CDI container edits are still left to follow-up work.
 
 ## Architecture
 
