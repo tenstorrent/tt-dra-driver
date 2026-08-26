@@ -38,7 +38,6 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
 	drapb "k8s.io/kubelet/pkg/apis/dra/v1"
@@ -89,10 +88,11 @@ type harness struct {
 	podUID          string
 	healthcheckPort int
 
-	config      *Config
-	driver      *driver
-	agentClient *fabricmanager.AgentClient
-	conns       []*grpc.ClientConn
+	config       *Config
+	driver       *driver
+	driverCancel context.CancelFunc
+	agentClient  *fabricmanager.AgentClient
+	conns        []*grpc.ClientConn
 
 	reg    registerapi.RegistrationClient
 	dra    drapb.DRAPluginClient
@@ -242,7 +242,13 @@ func (h *harness) startErr() error {
 		return fmt.Errorf("create the driver plugin path: %w", err)
 	}
 
-	driver, err := NewDriver(h.ctx, h.config)
+	// The driver's watch outlives NewDriver, so each instance gets a context
+	// the harness can cancel: a driver that has been stopped must not keep
+	// republishing behind the one that replaced it.
+	ctx, cancel := context.WithCancel(h.ctx)
+	h.driverCancel = cancel
+
+	driver, err := NewDriver(ctx, h.config)
 	if err != nil {
 		return err
 	}
@@ -253,6 +259,10 @@ func (h *harness) startErr() error {
 // stop shuts the driver down and releases the kubelet-side connections. It is
 // safe to call on a harness whose driver never started.
 func (h *harness) stop() {
+	if h.driverCancel != nil {
+		h.driverCancel()
+		h.driverCancel = nil
+	}
 	for _, conn := range h.conns {
 		_ = conn.Close()
 	}
@@ -628,23 +638,19 @@ func freePort(t *testing.T) int {
 	return addr.Port
 }
 
-// shortenEnumerateBackoff shrinks the driver's startup retry budget for the
-// duration of a test.
+// shortenInitialDevicesTimeout shrinks how long the driver waits for its first
+// set of devices, for the duration of a test.
 //
-// The backoff is a package variable rather than a flag, which is what lets a
+// The timeout is a package variable rather than a flag, which is what lets a
 // test tighten it without the driver growing a knob that only tests would set.
-// Production keeps its roughly five-minute budget.
-func shortenEnumerateBackoff(t *testing.T) {
+// Production keeps its five-minute budget.
+func shortenInitialDevicesTimeout(t *testing.T) {
 	t.Helper()
 
-	original := enumerateBackoff
-	t.Cleanup(func() { enumerateBackoff = original })
+	original := initialDevicesTimeout
+	t.Cleanup(func() { initialDevicesTimeout = original })
 
-	enumerateBackoff = wait.Backoff{
-		Duration: time.Millisecond,
-		Factor:   1.0,
-		Steps:    20,
-	}
+	initialDevicesTimeout = 100 * time.Millisecond
 }
 
 // emptyCDIRoot removes every file from the CDI root, modelling the tmpfs that
