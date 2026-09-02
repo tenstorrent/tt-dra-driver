@@ -23,9 +23,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"k8s.io/klog/v2"
 
 	agentpb "github.com/tenstorrent/tt-dra-driver/internal/fabricmanager/proto/agent"
 	topologypb "github.com/tenstorrent/tt-dra-driver/internal/fabricmanager/proto/topology"
@@ -84,11 +86,30 @@ func NewAgentClient(conn *grpc.ClientConn) *AgentClient {
 }
 
 // GetTopology implements TopologyClient.
+//
+// The call carries no deadline of its own, so how long it takes is bounded
+// only by the caller's context. Because grpc.NewClient connects lazily, this
+// is also where an agent that is down, unreachable or wedged first shows up,
+// which is why the elapsed time is logged for every outcome and repeated in
+// the returned error.
 func (c *AgentClient) GetTopology(ctx context.Context) (*topologypb.HostPhysicalTopology, error) {
+	logger := klog.FromContext(ctx).WithValues("agentAddress", c.target())
+	logger.V(4).Info("Calling GetTopology on the fabric manager agent")
+
+	start := time.Now()
 	resp, err := c.client.GetTopology(ctx, &agentpb.GetTopologyRequest{})
+	duration := time.Since(start)
 	if err != nil {
-		return nil, fmt.Errorf("call GetTopology: %w", err)
+		logger.V(2).Info("GetTopology call to the fabric manager agent failed", "duration", duration, "err", err)
+		return nil, fmt.Errorf("call GetTopology (after %s): %w", duration.Round(time.Millisecond), err)
 	}
+
+	logger.V(2).Info("GetTopology call to the fabric manager agent returned",
+		"duration", duration,
+		"status", resp.GetStatus(),
+		"numASICs", len(resp.GetPhysicalTopology().GetAsics()),
+	)
+
 	switch resp.GetStatus() {
 	case agentpb.GetTopologyStatus_TOPOLOGY_OK:
 		return resp.GetPhysicalTopology(), nil
@@ -97,6 +118,14 @@ func (c *AgentClient) GetTopology(ctx context.Context) (*topologypb.HostPhysical
 	default:
 		return nil, fmt.Errorf("fabric manager agent reported topology status %s", resp.GetStatus())
 	}
+}
+
+// target reports the address the client was built against, for log context.
+func (c *AgentClient) target() string {
+	if c == nil || c.conn == nil {
+		return ""
+	}
+	return c.conn.Target()
 }
 
 // Close releases the underlying gRPC connection.

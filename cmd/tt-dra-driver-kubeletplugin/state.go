@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sync"
 	"time"
@@ -86,7 +87,7 @@ type DeviceState struct {
 func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	driverResources, err := enumerateDevicesWithRetry(ctx, config.profile)
 	if err != nil {
-		return nil, fmt.Errorf("error enumerating all possible devices: %v", err)
+		return nil, fmt.Errorf("error enumerating all possible devices: %w", err)
 	}
 
 	cdi, err := NewCDIHandler(config.flags.cdiRoot, config.flags.driverName, config.flags.profile, config.profile.CommonContainerEdits())
@@ -163,40 +164,105 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 // ResourceSlice.
 func enumerateDevicesWithRetry(ctx context.Context, profile profiles.Profile) (resourceslice.DriverResources, error) {
 	logger := klog.FromContext(ctx)
+	logger.Info("Enumerating devices from the fabric manager agent")
+
+	start := time.Now()
+	attempts := 0
+
 	var driverResources resourceslice.DriverResources
 	err := retry.OnError(
 		enumerateBackoff,
 		func(err error) bool { return errors.Is(err, fabricmanager.ErrTopologyNotReady) },
 		func() error {
+			attempts++
+			attemptStart := time.Now()
+
 			var err error
 			driverResources, err = profile.EnumerateDevices(ctx)
-			if err != nil && errors.Is(err, fabricmanager.ErrTopologyNotReady) {
-				logger.Info("Fabric manager agent has not finished topology discovery yet; will retry")
+
+			switch {
+			case err == nil:
+			case errors.Is(err, fabricmanager.ErrTopologyNotReady):
+				logger.Info("Fabric manager agent has not finished topology discovery yet; will retry",
+					"attempt", attempts,
+					"attemptDuration", time.Since(attemptStart),
+					"elapsed", time.Since(start),
+				)
+			default:
+				// Not retried by the predicate above, but worth the same
+				// timing context: a slow failure here (an unreachable agent
+				// rather than an undiscovered one) is a driver startup that
+				// stalls and then crashloops.
+				logger.Info("Enumerating devices failed with a non-retryable error",
+					"attempt", attempts,
+					"attemptDuration", time.Since(attemptStart),
+					"elapsed", time.Since(start),
+					"err", err,
+				)
 			}
 			return err
 		},
 	)
 	if err != nil {
-		return resourceslice.DriverResources{}, err
+		return resourceslice.DriverResources{}, fmt.Errorf("after %d attempt(s) over %s: %w",
+			attempts, time.Since(start).Round(time.Millisecond), err)
 	}
+
+	logger.Info("Enumerated devices from the fabric manager agent",
+		"numDevices", countDevices(driverResources),
+		"attempts", attempts,
+		"duration", time.Since(start),
+	)
 	return driverResources, nil
+}
+
+// countDevices totals the devices across every pool and slice, for logging
+// how much the driver is about to advertise.
+func countDevices(driverResources resourceslice.DriverResources) int {
+	total := 0
+	for _, pool := range driverResources.Pools {
+		for _, slice := range pool.Slices {
+			total += len(slice.Devices)
+		}
+	}
+	return total
 }
 
 // Prepare reserves devices for a claim, materializes the per-claim CDI spec
 // file and persists the result to the on-disk checkpoint.
-func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]*drapbv1.Device, error) {
-	s.Lock()
-	defer s.Unlock()
-
+//
+// Every step that can account for wall-clock time is timed separately: the
+// whole body runs under the DeviceState lock, so concurrent prepares
+// serialize, and the checkpoint is read and rewritten in full on each call.
+// Both costs grow with the number of claims already prepared on the node,
+// which is logged alongside them as preparedClaims.
+func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceClaim) ([]*drapbv1.Device, error) {
+	logger := klog.FromContext(ctx)
 	claimUID := string(claim.UID)
 
+	callStart := time.Now()
+	s.Lock()
+	defer s.Unlock()
+	// A large lockWait means the time belongs to some other claim's disk
+	// I/O, not to this one.
+	lockWait := time.Since(callStart)
+
+	readStart := time.Now()
 	checkpoint := newCheckpoint()
 	if err := s.checkpointManager.GetCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
 		return nil, fmt.Errorf("unable to sync from checkpoint: %v", err)
 	}
+	checkpointRead := time.Since(readStart)
 	preparedClaims := checkpoint.V1.PreparedClaims
 
 	if preparedClaims[claimUID] != nil {
+		logger.V(2).Info("Claim is already prepared; returning the checkpointed devices",
+			"uid", claimUID,
+			"preparedClaims", len(preparedClaims),
+			"lockWait", lockWait,
+			"checkpointRead", checkpointRead,
+			"duration", time.Since(callStart),
+		)
 		return preparedClaims[claimUID].GetDevices(), nil
 	}
 
@@ -205,34 +271,64 @@ func (s *DeviceState) Prepare(claim *resourceapi.ResourceClaim) ([]*drapbv1.Devi
 		return nil, fmt.Errorf("prepare failed: %v", err)
 	}
 
+	specStart := time.Now()
 	if err := s.cdi.CreateClaimSpecFile(claimUID, preparedDevices); err != nil {
 		return nil, fmt.Errorf("unable to create CDI spec file for claim: %v", err)
 	}
+	cdiSpecWrite := time.Since(specStart)
 
 	preparedClaims[claimUID] = preparedDevices
+	writeStart := time.Now()
 	if err := s.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
 		return nil, fmt.Errorf("unable to sync to checkpoint: %v", err)
 	}
+	checkpointWrite := time.Since(writeStart)
 
+	logger.Info("Prepared claim",
+		"uid", claimUID,
+		"numDevices", len(preparedDevices),
+		"preparedClaims", len(preparedClaims),
+		"lockWait", lockWait,
+		"checkpointRead", checkpointRead,
+		"cdiSpecWrite", cdiSpecWrite,
+		"checkpointWrite", checkpointWrite,
+		"duration", time.Since(callStart),
+	)
 	return preparedClaims[claimUID].GetDevices(), nil
 }
 
 // Unprepare releases devices for a claim, deletes the per-claim CDI spec file
-// and persists the new state to the on-disk checkpoint.
-func (s *DeviceState) Unprepare(claimUID string) error {
+// and persists the new state to the on-disk checkpoint. It contends for the
+// same lock and rewrites the same checkpoint as Prepare, so it is timed the
+// same way: a slow unprepare delays the next pod that wants the device.
+func (s *DeviceState) Unprepare(ctx context.Context, claimUID string) error {
+	logger := klog.FromContext(ctx)
+
+	callStart := time.Now()
 	s.Lock()
 	defer s.Unlock()
+	lockWait := time.Since(callStart)
 
+	readStart := time.Now()
 	checkpoint := newCheckpoint()
 	if err := s.checkpointManager.GetCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
+		logger.Info("Unable to read the checkpoint during unprepare; starting a fresh one", "uid", claimUID, "err", err)
 		checkpoint = newCheckpoint()
 		if err := s.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
 			return fmt.Errorf("unable to create new checkpoint: %v", err)
 		}
 	}
+	checkpointRead := time.Since(readStart)
 	preparedClaims := checkpoint.V1.PreparedClaims
 
 	if preparedClaims[claimUID] == nil {
+		logger.V(2).Info("Claim is not prepared; nothing to unprepare",
+			"uid", claimUID,
+			"preparedClaims", len(preparedClaims),
+			"lockWait", lockWait,
+			"checkpointRead", checkpointRead,
+			"duration", time.Since(callStart),
+		)
 		return nil
 	}
 
@@ -240,15 +336,28 @@ func (s *DeviceState) Unprepare(claimUID string) error {
 		return fmt.Errorf("unprepare failed: %v", err)
 	}
 
+	specStart := time.Now()
 	if err := s.cdi.DeleteClaimSpecFile(claimUID); err != nil {
 		return fmt.Errorf("unable to delete CDI spec file for claim: %v", err)
 	}
+	cdiSpecDelete := time.Since(specStart)
 
 	delete(preparedClaims, claimUID)
+	writeStart := time.Now()
 	if err := s.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
 		return fmt.Errorf("unable to sync to checkpoint: %v", err)
 	}
+	checkpointWrite := time.Since(writeStart)
 
+	logger.Info("Unprepared claim",
+		"uid", claimUID,
+		"preparedClaims", len(preparedClaims),
+		"lockWait", lockWait,
+		"checkpointRead", checkpointRead,
+		"cdiSpecDelete", cdiSpecDelete,
+		"checkpointWrite", checkpointWrite,
+		"duration", time.Since(callStart),
+	)
 	return nil
 }
 
@@ -279,7 +388,13 @@ func (s *DeviceState) prepareDevices(claim *resourceapi.ResourceClaim) (profiles
 			continue
 		}
 		if _, exists := s.allocatable[result.Device]; !exists {
-			return nil, fmt.Errorf("requested device is not allocatable: %v", result.Device)
+			// The allocatable set is fixed at startup from a single
+			// enumeration, so this does not resolve on its own: the kubelet
+			// will retry NodePrepareResources with backoff until the driver
+			// is restarted. Name what the driver does know about, so the
+			// mismatch is diagnosable from one log line.
+			return nil, fmt.Errorf("requested device is not allocatable: %v (the driver enumerated %d device(s) at startup: %v)",
+				result.Device, len(s.allocatable), slices.Sorted(maps.Keys(s.allocatable)))
 		}
 		for _, c := range slices.Backward(configs) {
 			if len(c.Requests) == 0 || slices.Contains(c.Requests, result.Request) {

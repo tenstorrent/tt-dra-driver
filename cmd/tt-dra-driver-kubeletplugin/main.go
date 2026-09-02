@@ -211,6 +211,10 @@ func newApp() *cli.App {
 			if flags.fabricManagerAgentAddress == "" {
 				return fmt.Errorf("--fabric-manager-agent-address must be set")
 			}
+			// Dial does not block on connectivity, so this only records the
+			// address the driver will talk to; whether the agent is actually
+			// reachable first shows up on the initial GetTopology call.
+			klog.FromContext(ctx).Info("Using fabric manager agent", "address", flags.fabricManagerAgentAddress)
 			agentClient, err := fabricmanager.Dial(flags.fabricManagerAgentAddress)
 			if err != nil {
 				return fmt.Errorf("connect to fabric manager agent: %w", err)
