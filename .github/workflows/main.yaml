@@ -40,7 +40,7 @@ jobs:
       version: ${{ needs.semver.outputs.version }}
       images: ghcr.io/${{ github.repository }}
       context: .
-      dockerfile: docker/Dockerfile 
+      dockerfile: docker/Dockerfile
     secrets: inherit
     permissions:
       contents: read
