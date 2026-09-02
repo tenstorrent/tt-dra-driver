@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
 # Default values for tt-dra-driver.
 # This is a YAML-formatted file.
 # Declare variables to be passed into your templates.
@@ -38,7 +41,7 @@ kubeletPlugin:
   # node (each kubelet plugin must talk to its own node's agent). The
   # name is `<release>-agent.<namespace>.svc.cluster.local`; the default
   # below assumes the chart is installed as release `ttfm` in namespace
-  # `ttfm` (matches demo/scripts/common.sh). Override per cluster as
+  # `ttfm`. Override per cluster as
   # needed.
   fabricManagerAgentAddress: "tt-fabric-manager-agent.ttfm.svc.cluster.local:50053"
   priorityClassName: "system-node-critical"

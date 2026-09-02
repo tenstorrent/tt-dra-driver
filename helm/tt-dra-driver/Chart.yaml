@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
 apiVersion: v2
 name: tt-dra-driver
 description: Helm chart for the Tenstorrent Dynamic Resource Allocation (DRA) driver

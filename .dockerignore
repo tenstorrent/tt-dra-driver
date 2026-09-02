@@ -28,7 +28,7 @@ driver_image.tar
 [._]*.sw[a-p]
 
 # Cluster-side assets not consumed by the Go build.
-deployments/helm/
+helm/
 docker/
 
 # Documentation that doesn't affect the binary.
