@@ -122,6 +122,9 @@ spec:
         # agent. The kubelet plugin uses it to discover the local ASICs.
         - name: FABRIC_MANAGER_AGENT_ADDRESS
           value: "tt-fabric-manager-agent.ttfm.svc.cluster.local:50053"
+        # Whether to advertise whole trays alongside individual chips.
+        - name: ENABLE_TRAY_DEVICES
+          value: "true"
         - name: HEALTHCHECK_PORT
           value: "51515"
         - name: POD_UID
@@ -181,6 +184,36 @@ metadata:
   name: tenstorrent.com
 spec:
   extendedResourceName: tenstorrent.com/chip
+  # The driver publishes two kinds of device into the same pool: one per
+  # chip and one per physical tray. The `unit` attribute tells them apart,
+  # so this class pins it to "chip" and a request for a chip can never
+  # bind a whole tray.
+  #
+  # The has() guard keeps this class matching devices published by driver
+  # versions that predate the `unit` attribute (e.g. mid rolling update):
+  # those are all chips, and referencing a missing attribute would be a
+  # CEL error rather than a plain non-match.
   selectors:
   - cel:
-      expression: "device.driver == 'tenstorrent.com'"
+      expression: >-
+        device.driver == 'tenstorrent.com' &&
+        (!has(device.attributes['tenstorrent.com'].unit) ||
+        device.attributes['tenstorrent.com'].unit == 'chip')
+---
+# Source: tt-dra-driver/templates/deviceclass.yaml
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: tray.tenstorrent.com
+spec:
+  extendedResourceName: tenstorrent.com/tray
+  # A tray device covers every chip on one physical tray. Allocating it
+  # takes those chips out of the allocatable set (and vice versa) through
+  # the shared counters the driver publishes, so a tray claim and a chip
+  # claim never end up on the same silicon.
+  selectors:
+  - cel:
+      expression: >-
+        device.driver == 'tenstorrent.com' &&
+        has(device.attributes['tenstorrent.com'].unit) &&
+        device.attributes['tenstorrent.com'].unit == 'tray'
