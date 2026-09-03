@@ -1,10 +1,42 @@
+{{- $driver := include "tt-dra-driver.driverName" . -}}
 ---
 apiVersion: {{ include "tt-dra-driver.resourceApiVersion" . }}
 kind: DeviceClass
 metadata:
-  name: {{ include "tt-dra-driver.driverName" . }}
+  name: {{ $driver }}
 spec:
   extendedResourceName: tenstorrent.com/chip
+  # The driver publishes two kinds of device into the same pool: one per
+  # chip and one per physical tray. The `unit` attribute tells them apart,
+  # so this class pins it to "chip" and a request for a chip can never
+  # bind a whole tray.
+  #
+  # The has() guard keeps this class matching devices published by driver
+  # versions that predate the `unit` attribute (e.g. mid rolling update):
+  # those are all chips, and referencing a missing attribute would be a
+  # CEL error rather than a plain non-match.
   selectors:
   - cel:
-      expression: "device.driver == '{{ include "tt-dra-driver.driverName" . }}'"
+      expression: >-
+        device.driver == '{{ $driver }}' &&
+        (!has(device.attributes['{{ $driver }}'].unit) ||
+        device.attributes['{{ $driver }}'].unit == 'chip')
+{{- if .Values.kubeletPlugin.trayDevices }}
+---
+apiVersion: {{ include "tt-dra-driver.resourceApiVersion" . }}
+kind: DeviceClass
+metadata:
+  name: tray.{{ $driver }}
+spec:
+  extendedResourceName: tenstorrent.com/tray
+  # A tray device covers every chip on one physical tray. Allocating it
+  # takes those chips out of the allocatable set (and vice versa) through
+  # the shared counters the driver publishes, so a tray claim and a chip
+  # claim never end up on the same silicon.
+  selectors:
+  - cel:
+      expression: >-
+        device.driver == '{{ $driver }}' &&
+        has(device.attributes['{{ $driver }}'].unit) &&
+        device.attributes['{{ $driver }}'].unit == 'tray'
+{{- end }}

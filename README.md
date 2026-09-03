@@ -20,6 +20,27 @@ DRA Plugin daemonset connects to Fabric Manager Agent's local discovery endpoint
 
 ![alt text](img/dra-diagram.png)
 
+## Allocatable units
+
+The driver advertises the same hardware at two granularities:
+
+* **chips** — one device per MMIO-anchored chip bundle, in the
+  `tenstorrent.com` DeviceClass (extended resource `tenstorrent.com/chip`).
+* **trays** — one device per physical tray, in the `tray.tenstorrent.com`
+  DeviceClass (extended resource `tenstorrent.com/tray`). Allocating it hands
+  the container every chip on the tray.
+
+The two are mutually exclusive per tray: a tray cannot be allocated while any
+of its chips is in use, and no chip of a tray can be allocated while the tray
+is. This is expressed with DRA partitionable-device shared counters, so the
+scheduler enforces it. It needs the `DRAPartitionableDevices` feature gate
+(default on since Kubernetes 1.36); when the API server drops the counters the
+driver logs an error and publishes chips only. Trays can also be turned off
+with `--enable-tray-devices=false` (Helm: `kubeletPlugin.trayDevices=false`).
+
+See [docs/single-host.md](docs/single-host.md) for claim recipes and the full
+attribute reference.
+
 ## Usage example
 Create ResourceClaim targeting specific device by unique ID, for example:
 ```

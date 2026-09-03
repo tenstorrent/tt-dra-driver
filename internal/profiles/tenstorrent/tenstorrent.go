@@ -24,12 +24,22 @@
 // have no host-visible /dev/tenstorrent/<N> entry, so they are bundled
 // into the MMIO parent on the same physical tray and travel with it
 // whenever it is allocated.
+//
+// On top of those per-chip devices the profile also publishes one device
+// per physical tray, so a workload can claim a whole tray as a single
+// unit instead of enumerating its chips. Chip and tray devices describe
+// the same silicon, so they are mutually exclusive: allocating a tray
+// makes every chip on it unallocatable, and a single allocated chip makes
+// its tray unallocatable. That exclusion is expressed with DRA
+// partitionable-device counters (KEP-4815) and is therefore enforced by
+// the scheduler, not by this driver; see buildTrayCounterSets.
 package tenstorrent
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -59,6 +69,15 @@ const DefaultDriverName = "tenstorrent.com"
 
 // Vendor is the value reported in the `vendor` device attribute.
 const Vendor = "tenstorrent"
+
+// Values of the `unit` device attribute, which says what a device stands
+// for: a single MMIO-anchored chip bundle, or a whole physical tray.
+// DeviceClasses use it to keep the two apart, since both are published by
+// the same driver into the same pool.
+const (
+	UnitChip = "chip"
+	UnitTray = "tray"
+)
 
 // devicePathFmt is the path of the per-ASIC character device created by the
 // Tenstorrent KMD. The "%d" is the device node id reported by the
@@ -94,8 +113,8 @@ var boardTypeName = map[uint32]string{
 	5:  "p100",
 	6:  "p150",
 	7:  "p300",
-	8:  "galaxy", // legacy: UMD BoardType::GALAXY — TG 4U, deprecated in favor of 6U UBB
-	9:  "galaxy-wormhole", // matches KMD sysfs tt_card_type; UMD BoardType::UBB / UBB_WORMHOLE
+	8:  "galaxy",           // legacy: UMD BoardType::GALAXY — TG 4U, deprecated in favor of 6U UBB
+	9:  "galaxy-wormhole",  // matches KMD sysfs tt_card_type; UMD BoardType::UBB / UBB_WORMHOLE
 	10: "galaxy-blackhole", // matches KMD sysfs tt_card_type; UMD BoardType::UBB_BLACKHOLE
 	11: "quasar",
 	12: "unknown",
@@ -121,29 +140,65 @@ type hostBundle struct {
 	remotes []*topologypb.AsicInfo
 }
 
+// trayGroup is every bundle that sits on one physical tray, in ascending
+// MMIO chip-id order. It backs both the tray ResourceSlice device and the
+// counter that keeps that device mutually exclusive with its chips.
+type trayGroup struct {
+	trayID  uint32
+	bundles []hostBundle
+}
+
+// allocatableUnit is what one published ResourceSlice device resolves to
+// on this host: a single bundle for a chip device, or every bundle on the
+// tray for a tray device. ApplyConfig turns the bundle list into the set
+// of character devices a container gets.
+type allocatableUnit struct {
+	kind    string
+	trayID  uint32
+	bundles []hostBundle
+}
+
+// Options tunes what a Profile advertises.
+type Options struct {
+	// TrayDevices publishes one additional device per physical tray
+	// alongside the per-chip devices, letting a claim take a whole tray
+	// as one unit.
+	//
+	// Tray devices rely on ResourceSlice shared counters to stay
+	// mutually exclusive with the chip devices they cover, so they must
+	// only be enabled on clusters where the DRAPartitionableDevices
+	// feature gate is on. With the gate off the apiserver silently drops
+	// the counters and the scheduler would happily hand out a tray and
+	// its chips at the same time.
+	TrayDevices bool
+}
+
 // Profile is the Tenstorrent device profile.
 //
 // EnumerateDevices populates an internal map from ResourceSlice device
-// name to the hostBundle that produced it; ApplyConfig consults that map
-// to build per-device CDI container edits (e.g. /dev/tenstorrent/<chipID>
-// for the bundle's MMIO parent).
+// name to the allocatableUnit that produced it; ApplyConfig consults that
+// map to build per-device CDI container edits (e.g. /dev/tenstorrent/<N>
+// for every MMIO chip the unit covers).
 type Profile struct {
-	nodeName string
-	topology fabricmanager.TopologyClient
+	nodeName    string
+	topology    fabricmanager.TopologyClient
+	trayDevices bool
 
-	mu             sync.RWMutex
-	bundleByDevice map[string]hostBundle
+	mu           sync.RWMutex
+	unitByDevice map[string]allocatableUnit
 }
 
 // NewProfile constructs a Tenstorrent profile that publishes one
 // ResourceSlice device per MMIO-capable ASIC reported by the fabric
-// manager agent on the given node. The topology client must be non-nil;
-// pass a *fabricmanager.AgentClient in production and a fake in tests.
-func NewProfile(nodeName string, topology fabricmanager.TopologyClient) *Profile {
+// manager agent on the given node, plus one device per physical tray when
+// opts.TrayDevices is set. The topology client must be non-nil; pass a
+// *fabricmanager.AgentClient in production and a fake in tests.
+func NewProfile(nodeName string, topology fabricmanager.TopologyClient, opts Options) *Profile {
 	return &Profile{
-		nodeName:       nodeName,
-		topology:       topology,
-		bundleByDevice: make(map[string]hostBundle),
+		nodeName:     nodeName,
+		topology:     topology,
+		trayDevices:  opts.TrayDevices,
+		unitByDevice: make(map[string]allocatableUnit),
 	}
 }
 
@@ -160,27 +215,61 @@ func (p *Profile) EnumerateDevices(ctx context.Context) (resourceslice.DriverRes
 
 	logger := klog.FromContext(ctx)
 	bundles := bundleHostASICs(hostTopology.GetAsics(), logger)
+	trays := groupBundlesByTray(bundles)
 
-	devices := make([]resourceapi.Device, 0, len(bundles))
-	bundleByDevice := make(map[string]hostBundle, len(bundles))
+	// Counters only exist to keep tray devices exclusive with their
+	// chips, so a chips-only profile publishes none at all and keeps the
+	// ResourceSlice free of partitionable-device fields.
+	var counterSets []resourceapi.CounterSet
+	var counterSetByTray map[uint32]string
+	if p.trayDevices {
+		counterSets, counterSetByTray = buildTrayCounterSets(trays)
+	}
+
+	unitByDevice := make(map[string]allocatableUnit, len(bundles)+len(trays))
+
+	// Chip devices come first, in ascending chip-id order, so that the
+	// ResourceSlice ordering (which the allocator uses as its first-fit
+	// preference) is stable across calls and unchanged by the addition
+	// of tray devices.
+	devices := make([]resourceapi.Device, 0, len(bundles)+len(trays))
 	for _, bundle := range bundles {
-		device := bundleToDevice(bundle)
+		trayID := bundle.mmio.GetTrayId()
+		device := chipDevice(bundle, counterSetByTray[trayID])
 		devices = append(devices, device)
-		bundleByDevice[device.Name] = bundle
+		unitByDevice[device.Name] = allocatableUnit{
+			kind:    UnitChip,
+			trayID:  trayID,
+			bundles: []hostBundle{bundle},
+		}
+	}
+	if p.trayDevices {
+		for _, tray := range trays {
+			device := trayDevice(tray, counterSetByTray[tray.trayID], logger)
+			devices = append(devices, device)
+			unitByDevice[device.Name] = allocatableUnit{
+				kind:    UnitTray,
+				trayID:  tray.trayID,
+				bundles: tray.bundles,
+			}
+		}
 	}
 
 	p.mu.Lock()
-	p.bundleByDevice = bundleByDevice
+	p.unitByDevice = unitByDevice
 	p.mu.Unlock()
+
+	logger.V(2).Info("Enumerated Tenstorrent allocatable units",
+		"chipDevices", len(bundles),
+		"trayDevices", len(devices)-len(bundles),
+		"trays", len(trays),
+		"counterSets", len(counterSets),
+	)
 
 	return resourceslice.DriverResources{
 		Pools: map[string]resourceslice.Pool{
 			p.nodeName: {
-				Slices: []resourceslice.Slice{
-					{
-						Devices: devices,
-					},
-				},
+				Slices: buildSlices(devices, counterSets),
 			},
 		},
 	}, nil
@@ -230,11 +319,12 @@ func (p *Profile) Validate(config runtime.Object) error {
 
 // ApplyConfig implements profiles.ConfigHandler.
 //
-// It produces per-device CDI container edits that expose
-// /dev/tenstorrent/<chipID> to the workload for every allocated device.
-// Because EnumerateDevices only ever publishes MMIO-capable ASICs (with
-// any non-MMIO siblings bundled in), every entry in results corresponds
-// to exactly one host-visible character device.
+// It produces per-device CDI container edits that expose one
+// /dev/tenstorrent/<N> character device per MMIO chip the allocated device
+// covers: a single node for a chip device, and every MMIO chip on the tray
+// for a tray device. Because EnumerateDevices only ever anchors units on
+// MMIO-capable ASICs (with any non-MMIO siblings bundled in), each bundle
+// corresponds to exactly one host-visible character device.
 func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.DeviceRequestAllocationResult) (profiles.PerDeviceCDIContainerEdits, error) {
 	if config != nil {
 		return nil, errors.New("tenstorrent profile: opaque configuration is not supported yet")
@@ -245,26 +335,29 @@ func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devi
 
 	edits := make(profiles.PerDeviceCDIContainerEdits, len(results))
 	for _, result := range results {
-		bundle, ok := p.bundleByDevice[result.Device]
+		unit, ok := p.unitByDevice[result.Device]
 		if !ok {
 			return nil, fmt.Errorf("tenstorrent profile: device %q is not in the latest enumeration", result.Device)
 		}
-		// Defensive: EnumerateDevices is responsible for filtering
-		// non-MMIO chips out of the ResourceSlice. If one ever leaks
-		// through, fail loudly rather than silently producing a CDI spec
-		// with no device node.
-		if !bundle.mmio.GetIsMmioCapable() {
-			return nil, fmt.Errorf("tenstorrent profile: device %q resolves to a non-MMIO ASIC, which should never appear in the ResourceSlice", result.Device)
+		deviceNodes := make([]*cdispec.DeviceNode, 0, len(unit.bundles))
+		for _, bundle := range unit.bundles {
+			// Defensive: EnumerateDevices is responsible for anchoring
+			// every unit on an MMIO chip. If a non-MMIO one ever leaks
+			// through, fail loudly rather than silently producing a CDI
+			// spec with a missing device node.
+			if !bundle.mmio.GetIsMmioCapable() {
+				return nil, fmt.Errorf("tenstorrent profile: %s device %q (tray %d) resolves to non-MMIO ASIC chip %d, which should never appear in the ResourceSlice",
+					unit.kind, result.Device, unit.trayID, bundle.mmio.GetChipId())
+			}
+			deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
+				Path:        fmt.Sprintf(devicePathFmt, bundle.mmio.GetDeviceNodeId()),
+				Type:        "c",
+				Permissions: "rw",
+			})
 		}
 		edits[result.Device] = &cdiapi.ContainerEdits{
 			ContainerEdits: &cdispec.ContainerEdits{
-				DeviceNodes: []*cdispec.DeviceNode{
-					{
-						Path:        fmt.Sprintf(devicePathFmt, bundle.mmio.GetDeviceNodeId()),
-						Type:        "c",
-						Permissions: "rw",
-					},
-				},
+				DeviceNodes: deviceNodes,
 			},
 		}
 	}
@@ -314,6 +407,27 @@ func bundleHostASICs(asics []*topologypb.AsicInfo, logger klog.Logger) []hostBun
 	return bundles
 }
 
+// groupBundlesByTray collects bundles into per-tray groups, sorted by tray
+// id, with each group's bundles left in the ascending chip-id order
+// bundleHostASICs produced. Trays are the granularity at which whole-board
+// devices are published and at which shared counters are defined.
+func groupBundlesByTray(bundles []hostBundle) []trayGroup {
+	byTray := make(map[uint32][]hostBundle)
+	for _, bundle := range bundles {
+		trayID := bundle.mmio.GetTrayId()
+		byTray[trayID] = append(byTray[trayID], bundle)
+	}
+
+	trays := make([]trayGroup, 0, len(byTray))
+	for trayID, group := range byTray {
+		trays = append(trays, trayGroup{trayID: trayID, bundles: group})
+	}
+	sort.Slice(trays, func(i, j int) bool {
+		return trays[i].trayID < trays[j].trayID
+	})
+	return trays
+}
+
 // splitByMmio partitions a list of ASICs into MMIO-capable and non-MMIO
 // (remote) subsets, preserving relative order within each.
 func splitByMmio(asics []*topologypb.AsicInfo) (mmio, remote []*topologypb.AsicInfo) {
@@ -337,16 +451,95 @@ func chipIDsOf(asics []*topologypb.AsicInfo) []uint32 {
 	return ids
 }
 
-// bundleToDevice converts a hostBundle into a ResourceSlice device. The
-// device name uses the MMIO parent's host-local chip id so it is stable
-// across agent restarts on the same host.
-func bundleToDevice(bundle hostBundle) resourceapi.Device {
+// buildTrayCounterSets defines the shared counters that make a tray device
+// and the chip devices on that tray mutually exclusive.
+//
+// Every tray gets exactly one counter, `tray-<trayID>`, whose value is the
+// number of chip devices on the tray. A chip device consumes one unit of
+// its tray's counter; the tray device consumes all of them. The scheduler
+// therefore rejects a tray whenever any of its chips is already allocated
+// (the counter is short by at least one), and rejects every chip once the
+// tray is allocated (the counter is fully drained) — which is exactly the
+// exclusion this profile needs, without the driver having to track
+// allocations itself.
+//
+// The counters are spread over as many counter sets as needed to respect
+// the per-set counter limit; the returned map says which set holds a given
+// tray's counter.
+func buildTrayCounterSets(trays []trayGroup) ([]resourceapi.CounterSet, map[uint32]string) {
+	counterSetByTray := make(map[uint32]string, len(trays))
+	if len(trays) == 0 {
+		return nil, counterSetByTray
+	}
+
+	var counterSets []resourceapi.CounterSet
+	for chunk := range slices.Chunk(trays, resourceapi.ResourceSliceMaxCountersPerCounterSet) {
+		name := counterSetName(len(counterSets))
+		counters := make(map[string]resourceapi.Counter, len(chunk))
+		for _, tray := range chunk {
+			counters[counterNameForTray(tray.trayID)] = newCounter(int64(len(tray.bundles)))
+			counterSetByTray[tray.trayID] = name
+		}
+		counterSets = append(counterSets, resourceapi.CounterSet{
+			Name:     name,
+			Counters: counters,
+		})
+	}
+	return counterSets, counterSetByTray
+}
+
+// buildSlices packs devices and counter sets into ResourceSlices that stay
+// within the API's per-slice limits. Devices and shared counters cannot be
+// mixed in one ResourceSlice, so the counters get slices of their own,
+// appended after the device slices: the allocator reads counters
+// pool-wide, while slice order only influences which devices it tries
+// first.
+//
+// At least one slice is always returned, even for a host with no usable
+// ASICs: an empty pool tells the scheduler the driver is running and has
+// nothing to offer, which is different from no pool at all.
+func buildSlices(devices []resourceapi.Device, counterSets []resourceapi.CounterSet) []resourceslice.Slice {
+	maxDevices := resourceapi.ResourceSliceMaxDevices
+	if len(counterSets) > 0 {
+		// Devices that consume counters are subject to the lower
+		// advanced-features cap.
+		maxDevices = resourceapi.ResourceSliceMaxDevicesWithAdvancedFeatures
+	}
+
+	var out []resourceslice.Slice
+	for chunk := range slices.Chunk(devices, maxDevices) {
+		out = append(out, resourceslice.Slice{Devices: chunk})
+	}
+	if len(out) == 0 {
+		out = append(out, resourceslice.Slice{Devices: devices})
+	}
+	for chunk := range slices.Chunk(counterSets, resourceapi.ResourceSliceMaxCounterSets) {
+		out = append(out, resourceslice.Slice{SharedCounters: chunk})
+	}
+	return out
+}
+
+// chipDevice converts a hostBundle into a ResourceSlice device. The device
+// name uses the MMIO parent's host-local chip id so it is stable across
+// agent restarts on the same host. counterSet names the counter set
+// holding this chip's tray counter, or is empty when tray devices are
+// disabled and no counters are published.
+func chipDevice(bundle hostBundle, counterSet string) resourceapi.Device {
 	mmio := bundle.mmio
 	device := resourceapi.Device{
 		Name: deviceNameForChip(mmio.GetChipId()),
+		// A chip device holds one unit of its tray's counter for as long
+		// as it is allocated, which is what blocks the tray device.
+		ConsumesCounters: trayCounterConsumption(counterSet, mmio.GetTrayId(), 1),
 		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 			"vendor": {
 				StringValue: ptr.To(Vendor),
+			},
+			// unit distinguishes the per-chip devices from the whole-tray
+			// devices published alongside them. DeviceClasses select on
+			// it so that a request for one never binds the other.
+			"unit": {
+				StringValue: ptr.To(UnitChip),
 			},
 			"chipID": {
 				IntValue: ptr.To(int64(mmio.GetChipId())),
@@ -403,7 +596,7 @@ func bundleToDevice(bundle hostBundle) resourceapi.Device {
 			StringValue: ptr.To(strings.Join(uniqueIDs, ",")),
 		}
 	}
-	if total := totalMemoryBytes(bundle); total > 0 {
+	if total := bundlesMemoryBytes([]hostBundle{bundle}); total > 0 {
 		device.Capacity = map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
 			"memory": {
 				Value: *resource.NewQuantity(int64(total), resource.BinarySI),
@@ -413,15 +606,139 @@ func bundleToDevice(bundle hostBundle) resourceapi.Device {
 	return device
 }
 
-// totalMemoryBytes returns the aggregate DRAM advertised by every ASIC in
-// the bundle. Reporting the bundled total (rather than just the MMIO
-// chip's memory) lets schedulers express memory requests in terms of the
-// physically usable memory the workload will see when allocated this
+// trayDevice converts a trayGroup into the ResourceSlice device that
+// represents the whole physical tray. Allocating it grants the container
+// every MMIO chip on the tray at once (plus their bundled remotes) and,
+// through the tray counter, takes the tray's chip devices out of the
+// allocatable set.
+//
+// Board-identity attributes (boardType, boardName, chipArch) describe the
+// tray as a whole and are taken from its lowest-chip-id bundle. A tray is
+// one physical board, so those values are expected to agree across its
+// chips; a tray that disagrees is logged and still described by that
+// representative chip.
+func trayDevice(tray trayGroup, counterSet string, logger klog.Logger) resourceapi.Device {
+	representative := tray.bundles[0].mmio
+	warnIfHeterogeneous(tray, logger)
+
+	chipCount := 0
+	for _, bundle := range tray.bundles {
+		chipCount += 1 + len(bundle.remotes)
+	}
+
+	device := resourceapi.Device{
+		Name: deviceNameForTray(tray.trayID),
+		// The tray device consumes its tray counter in full: while it is
+		// allocated no chip device on the tray can be, and it cannot be
+		// allocated while any of them is.
+		ConsumesCounters: trayCounterConsumption(counterSet, tray.trayID, int64(len(tray.bundles))),
+		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+			"vendor": {
+				StringValue: ptr.To(Vendor),
+			},
+			"unit": {
+				StringValue: ptr.To(UnitTray),
+			},
+			"trayID": {
+				IntValue: ptr.To(int64(tray.trayID)),
+			},
+			"boardType": {
+				IntValue: ptr.To(int64(representative.GetBoardType())),
+			},
+			"boardName": {
+				StringValue: ptr.To(boardNameFor(representative.GetBoardType())),
+			},
+			"chipArch": {
+				StringValue: ptr.To(representative.GetChipArch()),
+			},
+			// uniqueID of the tray's lowest-chip-id MMIO ASIC. It is the
+			// stable handle for pinning a workload to one physical tray,
+			// the same way chip devices are pinned by uniqueID.
+			"uniqueID": {
+				StringValue: ptr.To(fmt.Sprintf("%d", representative.GetUniqueId())),
+			},
+			// chipCount is the total number of ASICs on the tray: every
+			// MMIO chip plus their bundled non-MMIO siblings.
+			"chipCount": {
+				IntValue: ptr.To(int64(chipCount)),
+			},
+			// chipDeviceCount is how many chip devices this tray covers,
+			// i.e. how many separately allocatable units the tray device
+			// takes out of circulation while it is held.
+			"chipDeviceCount": {
+				IntValue: ptr.To(int64(len(tray.bundles))),
+			},
+		},
+	}
+	if total := bundlesMemoryBytes(tray.bundles); total > 0 {
+		device.Capacity = map[resourceapi.QualifiedName]resourceapi.DeviceCapacity{
+			"memory": {
+				Value: *resource.NewQuantity(int64(total), resource.BinarySI),
+			},
+		}
+	}
+	return device
+}
+
+// warnIfHeterogeneous logs when the chips on one tray disagree about board
+// type or architecture. That should not happen for a physical tray, and it
+// means the tray device's board attributes describe only its
+// representative chip.
+func warnIfHeterogeneous(tray trayGroup, logger klog.Logger) {
+	representative := tray.bundles[0].mmio
+	for _, bundle := range tray.bundles[1:] {
+		if bundle.mmio.GetBoardType() != representative.GetBoardType() ||
+			bundle.mmio.GetChipArch() != representative.GetChipArch() {
+			logger.Info("Tenstorrent tray reports chips of differing board type or architecture; the tray device describes its lowest-chip-id ASIC",
+				"trayID", tray.trayID,
+				"boardType", representative.GetBoardType(),
+				"chipArch", representative.GetChipArch(),
+				"otherChipID", bundle.mmio.GetChipId(),
+				"otherBoardType", bundle.mmio.GetBoardType(),
+				"otherChipArch", bundle.mmio.GetChipArch(),
+			)
+			return
+		}
+	}
+}
+
+// trayCounterConsumption declares that a device consumes count units of
+// its tray's shared counter. It returns nil when no counter set was
+// published (tray devices disabled), leaving the device free of
+// partitionable-device fields.
+func trayCounterConsumption(counterSet string, trayID uint32, count int64) []resourceapi.DeviceCounterConsumption {
+	if counterSet == "" {
+		return nil
+	}
+	return []resourceapi.DeviceCounterConsumption{
+		{
+			CounterSet: counterSet,
+			Counters: map[string]resourceapi.Counter{
+				counterNameForTray(trayID): newCounter(count),
+			},
+		},
+	}
+}
+
+// newCounter builds a shared counter quantity. Counters are plain
+// integers: the number of chip devices on a tray, or how many of them a
+// device holds.
+func newCounter(value int64) resourceapi.Counter {
+	return resourceapi.Counter{Value: *resource.NewQuantity(value, resource.DecimalSI)}
+}
+
+// bundlesMemoryBytes returns the aggregate DRAM advertised by every ASIC
+// in the given bundles. Reporting the bundled total (rather than just the
+// MMIO chips' memory) lets schedulers express memory requests in terms of
+// the physically usable memory the workload will see when allocated the
 // device.
-func totalMemoryBytes(bundle hostBundle) uint64 {
-	total := bundle.mmio.GetMemoryBytes()
-	for _, r := range bundle.remotes {
-		total += r.GetMemoryBytes()
+func bundlesMemoryBytes(bundles []hostBundle) uint64 {
+	var total uint64
+	for _, bundle := range bundles {
+		total += bundle.mmio.GetMemoryBytes()
+		for _, r := range bundle.remotes {
+			total += r.GetMemoryBytes()
+		}
 	}
 	return total
 }
@@ -430,4 +747,23 @@ func totalMemoryBytes(bundle hostBundle) uint64 {
 // for an ASIC with the given host-local chip id.
 func deviceNameForChip(chipID uint32) string {
 	return fmt.Sprintf("tt-%d", chipID)
+}
+
+// deviceNameForTray returns the canonical ResourceSlice device name used
+// for a whole physical tray. The "tray" infix keeps it from ever colliding
+// with a chip device name.
+func deviceNameForTray(trayID uint32) string {
+	return fmt.Sprintf("tt-tray-%d", trayID)
+}
+
+// counterSetName returns the name of the i-th counter set published for
+// this node's trays.
+func counterSetName(i int) string {
+	return fmt.Sprintf("tt-trays-%d", i)
+}
+
+// counterNameForTray returns the name of the counter that tracks how much
+// of a tray is still free.
+func counterNameForTray(trayID uint32) string {
+	return fmt.Sprintf("tray-%d", trayID)
 }

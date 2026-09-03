@@ -41,6 +41,19 @@ kubeletPlugin:
   # `ttfm` (matches demo/scripts/common.sh). Override per cluster as
   # needed.
   fabricManagerAgentAddress: "tt-fabric-manager-agent.ttfm.svc.cluster.local:50053"
+  # trayDevices publishes one allocatable device per physical tray in
+  # addition to the per-chip devices, and installs a `tray.<driverName>`
+  # DeviceClass for claiming them. A tray and the chips it contains are
+  # mutually exclusive: whichever is claimed first makes the other
+  # unallocatable until it is released.
+  #
+  # The exclusion is expressed with ResourceSlice shared counters, so it
+  # needs the DRAPartitionableDevices feature gate enabled on the API
+  # server and the scheduler (on by default since Kubernetes 1.36). On a
+  # cluster that drops the counters the kubelet plugin logs an error and
+  # publishes per-chip devices only, rather than advertising trays it
+  # cannot keep exclusive.
+  trayDevices: true
   priorityClassName: "system-node-critical"
   updateStrategy:
     type: RollingUpdate

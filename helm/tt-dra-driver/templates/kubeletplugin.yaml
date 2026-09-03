@@ -81,6 +81,9 @@ spec:
         # agent. The kubelet plugin uses it to discover the local ASICs.
         - name: FABRIC_MANAGER_AGENT_ADDRESS
           value: {{ .Values.kubeletPlugin.fabricManagerAgentAddress | quote }}
+        # Whether to advertise whole trays alongside individual chips.
+        - name: ENABLE_TRAY_DEVICES
+          value: {{ .Values.kubeletPlugin.trayDevices | quote }}
         {{- if .Values.kubeletPlugin.containers.plugin.healthcheckPort }}
         - name: HEALTHCHECK_PORT
           value: {{ .Values.kubeletPlugin.containers.plugin.healthcheckPort | quote }}
