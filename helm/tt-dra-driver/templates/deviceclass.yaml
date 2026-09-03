@@ -4,6 +4,7 @@ kind: DeviceClass
 metadata:
   name: {{ include "tt-dra-driver.driverName" . }}
 spec:
+  extendedResourceName: tenstorrent.com/chip
   selectors:
   - cel:
       expression: "device.driver == '{{ include "tt-dra-driver.driverName" . }}'"
