@@ -59,6 +59,7 @@ type Flags struct {
 	driverName                    string
 	podUID                        string
 	fabricManagerAgentAddress     string
+	enableTrayDevices             bool
 }
 
 // Config is the runtime configuration assembled from Flags.
@@ -74,7 +75,9 @@ type Config struct {
 // validProfiles holds the set of profile names selectable via --device-profile.
 var validProfiles = map[string]func(flags Flags, agent fabricmanager.TopologyClient) profiles.Profile{
 	tenstorrent.ProfileName: func(f Flags, agent fabricmanager.TopologyClient) profiles.Profile {
-		return tenstorrent.NewProfile(f.nodeName, agent)
+		return tenstorrent.NewProfile(f.nodeName, agent, tenstorrent.Options{
+			TrayDevices: f.enableTrayDevices,
+		})
 	},
 }
 
@@ -169,6 +172,16 @@ func newApp() *cli.App {
 			Destination: &flags.driverName,
 			EnvVars:     []string{"DRIVER_NAME"},
 		},
+		&cli.BoolFlag{
+			Name: "enable-tray-devices",
+			Usage: "Publish one allocatable device per physical tray in addition to the per-chip devices. " +
+				"Tray devices are kept mutually exclusive with the chips they contain through ResourceSlice shared counters, " +
+				"which requires the DRAPartitionableDevices feature gate on the apiserver and the scheduler; " +
+				"when the apiserver does not keep them, the driver logs an error and falls back to per-chip devices only.",
+			Value:       true,
+			Destination: &flags.enableTrayDevices,
+			EnvVars:     []string{"ENABLE_TRAY_DEVICES"},
+		},
 		&cli.StringFlag{
 			Name:        "pod-uid",
 			Usage:       "UID of the pod (used for seamless upgrades to create unique socket names).",
@@ -219,6 +232,11 @@ func newApp() *cli.App {
 			if err != nil {
 				return fmt.Errorf("connect to fabric manager agent: %w", err)
 			}
+
+			// Confirm against the apiserver that whole-tray devices can
+			// be published safely before the profile is built around
+			// them.
+			flags.enableTrayDevices = resolveTrayDevices(ctx, clientSets.Core, flags)
 
 			config := &Config{
 				flags:             flags,
