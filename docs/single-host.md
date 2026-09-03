@@ -13,7 +13,13 @@ The DRA driver publishes one `ResourceSlice` device per MMIO-anchored
 bundle. An n300 bundles its non-MMIO remote sibling under the MMIO parent so
 a single claim gives the container both chips. A 6U Wormhole Galaxy exposes
 every chip via PCIe MMIO, so all 32 surface as individual devices — you claim
-them as a set (`count: 32`), not as a single bundle.
+them as a set (`count: 32`), or as one tray device (see
+[Claiming whole trays](#claiming-whole-trays)).
+
+Alongside those per-chip devices the driver publishes one device per
+physical **tray**, so a whole board can be claimed as a single unit. The two
+views describe the same silicon and are mutually exclusive — see
+[Claiming whole trays](#claiming-whole-trays).
 
 ```{note}
 Multi-host layouts — one host's share of a multi-host Galaxy, or a whole
@@ -57,10 +63,13 @@ kubectl get resourceslice -o yaml | \
 
 Every device in the `tenstorrent.com` DeviceClass carries the attributes below.
 Reference them in CEL selectors as `device.attributes["tenstorrent.com"].<name>`.
+Tray devices live in the `tray.tenstorrent.com` DeviceClass and carry a
+[slightly different set](#tray-attribute-reference).
 
 | Attribute         | Type   | When set     | Value                                                                                    |
 | ----------------- | ------ | ------------ | ---------------------------------------------------------------------------------------- |
 | `vendor`          | string | always       | Constant `"tenstorrent.com"`.                                                            |
+| `unit`            | string | always       | Constant `"chip"`. Distinguishes these devices from the `"tray"` ones; the DeviceClass already filters on it, so claims rarely need to.  |
 | `chipArch`        | string | always       | ASIC architecture. Currently `"wormhole"` or `"blackhole"`.                              |
 | `chipCount`       | int    | always       | Total ASICs a workload gets from this device: the MMIO parent plus bundled remote siblings on the same tray. Match on it to require an n300 (`== 2`) or a single-chip card (`== 1`). |
 | `chipID`          | int    | always       | Host-local chip ID of the MMIO parent. Stable across agent restarts on the same host.    |
@@ -84,6 +93,121 @@ Attributes are set per MMIO-anchored *bundle*, not per ASIC. For an n300 the
 listed `chipID`, `uniqueID`, `trayID`, `asicLocation`, and `pciAddress` refer
 to the MMIO parent; the remote sibling's IDs appear in `remoteChipIDs` /
 `remoteUniqueIDs`, and its DRAM is folded into the `memory` capacity.
+```
+
+## Claiming whole trays
+
+A tray is one physical board. For an n150 or an n300 it holds a single chip
+device; for a 6U UBB Galaxy it holds all 32. The driver publishes one device
+per tray in its own DeviceClass, `tray.tenstorrent.com`, so a workload that
+wants the whole board can ask for one device instead of counting chips:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: whole-tray
+spec:
+  devices:
+    requests:
+      - name: tray
+        exactly:
+          deviceClassName: tray.tenstorrent.com
+```
+
+The container gets every `/dev/tenstorrent/<N>` node on that tray at once.
+
+### Chips and trays are mutually exclusive
+
+A tray device and the chip devices on it describe the same silicon, so only
+one view of a tray can be in use at a time:
+
+- While a tray is allocated, none of its chips can be allocated.
+- While *any* chip on a tray is allocated, that tray cannot be allocated.
+- Chips on *other* trays are unaffected, and two chips on the same tray can
+  still be held by different claims.
+
+The driver enforces this by publishing one shared counter per tray, sized to
+the number of chip devices on it: each chip device consumes one unit, the tray
+device consumes all of them. The scheduler does the arithmetic, so a blocked
+claim simply stays `Pending` — it never lands on hardware someone else holds.
+
+```{important}
+Shared counters need the `DRAPartitionableDevices` feature gate on the API
+server **and** the scheduler. It is on by default from Kubernetes 1.36; on
+1.33–1.35 it must be enabled explicitly. If the API server drops the
+counters, the kubelet plugin logs an error and publishes per-chip devices
+only rather than advertising trays it cannot keep exclusive — so no
+`tray.tenstorrent.com` devices will show up in `kubectl get resourceslice`.
+Set `kubeletPlugin.trayDevices=false` in the Helm chart to opt out
+deliberately.
+```
+
+### Tray attribute reference
+
+Tray devices carry board identity and totals for the tray as a whole. The
+values come from the tray's lowest-chip-id MMIO ASIC, which for a physical
+board is representative of all of them.
+
+| Attribute         | Type   | Value                                                                                          |
+| ----------------- | ------ | ---------------------------------------------------------------------------------------------- |
+| `vendor`          | string | Constant `"tenstorrent.com"`.                                                                  |
+| `unit`            | string | Constant `"tray"`.                                                                             |
+| `trayID`          | int    | Physical tray identifier, matching the `trayID` of its chip devices.                           |
+| `boardName`       | string | Human-readable board type, same vocabulary as for chip devices.                                |
+| `boardType`       | int    | Numeric board-type enum. Prefer `boardName`.                                                   |
+| `chipArch`        | string | ASIC architecture, e.g. `"wormhole"` or `"blackhole"`.                                         |
+| `uniqueID`        | string | `uniqueID` of the tray's lowest-chip-id MMIO ASIC. Use it to pin a workload to one exact tray. |
+| `chipCount`       | int    | Total ASICs on the tray, including bundled non-MMIO siblings.                                  |
+| `chipDeviceCount` | int    | How many chip devices the tray covers, i.e. how many separately allocatable units it takes out of circulation while held. |
+
+| Capacity | Unit     | Value                                       |
+| -------- | -------- | ------------------------------------------- |
+| `memory` | BinarySI | Aggregate DRAM across every ASIC on the tray. |
+
+### Whole Galaxy as one claim
+
+A 6U Wormhole Galaxy is one tray of 32 MMIO chips, so the `count: 32` recipe
+[below](#whole-wormhole-galaxy-6u-ubb-single-host) and a single tray claim
+give the same 32 device nodes. The tray form is preferable: it does not
+depend on knowing the chip count, and it is atomic — a `count: 32` request
+either finds 32 free chips or stays pending, whereas a tray request also
+guarantees nobody else can take a chip out from under it later.
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: whole-galaxy-tray
+spec:
+  devices:
+    requests:
+      - name: tray
+        exactly:
+          deviceClassName: tray.tenstorrent.com
+          selectors:
+            - cel:
+                expression: |
+                  device.attributes["tenstorrent.com"].boardName == "galaxy-wormhole"
+```
+
+### Every tray on the host
+
+Hosts with several boards expose several tray devices. Claim them all with
+`count`:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: all-trays
+spec:
+  devices:
+    requests:
+      - name: trays
+        exactly:
+          deviceClassName: tray.tenstorrent.com
+          count: 4
 ```
 
 ## Claim recipes
@@ -392,6 +516,21 @@ Each of the three pods gets its own n150 on whatever host has one free.
 - Every UBB chip is its own bundle — a single request without `count` binds
   exactly one. Add `count: 32` (or the actual per-host bundle count you see
   in `kubectl get resourceslice -o yaml`) so DRA allocates the full set.
+
+**Tray claim stays `Pending` on a host that looks idle.**
+- A tray is blocked by *any* allocated chip on it. Check for claims holding
+  its chips: `kubectl get resourceclaim -A -o yaml | grep -B5 'device: tt-'`.
+- Conversely, a chip claim stays pending while its tray is held. The chip and
+  tray devices of one tray share a counter and cannot both be in use.
+
+**No `tray.tenstorrent.com` devices in `kubectl get resourceslice`.**
+- The driver falls back to per-chip devices when the API server drops
+  ResourceSlice shared counters. Check the kubelet-plugin logs for the
+  `DRAPartitionableDevices` error and enable that feature gate on the API
+  server and the scheduler.
+- Or trays were turned off deliberately: check
+  `kubeletPlugin.trayDevices` in the Helm values and the
+  `ENABLE_TRAY_DEVICES` env var on the DaemonSet.
 
 **Pod scheduled but `/dev/tenstorrent` empty.**
 - The CDI edits are still evolving. Confirm the driver version and check the
