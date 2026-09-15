@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: The Kubernetes Authors
+// SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
 /*
  * Copyright The Kubernetes Authors
  * Modifications Copyright 2026 Tenstorrent USA, Inc.
