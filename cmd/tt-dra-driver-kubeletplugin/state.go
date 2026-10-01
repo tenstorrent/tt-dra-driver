@@ -145,18 +145,79 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unable to list checkpoints: %v", err)
 	}
-	for _, c := range checkpoints {
-		if c == DriverPluginCheckpointFile {
-			return state, nil
+	if !slices.Contains(checkpoints, DriverPluginCheckpointFile) {
+		if err := state.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, newCheckpoint()); err != nil {
+			return nil, fmt.Errorf("unable to sync to checkpoint: %v", err)
 		}
 	}
 
-	checkpoint := newCheckpoint()
-	if err := state.checkpointManager.CreateCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
-		return nil, fmt.Errorf("unable to sync to checkpoint: %v", err)
+	if err := state.reconcileCDISpecs(ctx); err != nil {
+		return nil, fmt.Errorf("unable to reconcile CDI spec files with the checkpoint: %w", err)
 	}
 
 	return state, nil
+}
+
+// reconcileCDISpecs brings the CDI root back in line with the checkpoint: it
+// rewrites the per-claim spec file of every claim the checkpoint records as
+// prepared, and removes the per-claim spec files it does not.
+//
+// The two outlive the driver process for different lengths of time. The
+// checkpoint lives under the kubelet's plugin directory on disk, while the CDI
+// root is a tmpfs on most distributions, so a node reboot leaves the driver
+// believing claims are prepared while the spec files the container runtime
+// resolves against are gone. Regenerating them here lets an already-allocated
+// claim recover on its own, instead of leaving its pods in
+// CreateContainerError until the workload is scaled down far enough to release
+// the claim.
+func (s *DeviceState) reconcileCDISpecs(ctx context.Context) error {
+	logger := klog.FromContext(ctx)
+
+	start := time.Now()
+	s.Lock()
+	defer s.Unlock()
+
+	checkpoint := newCheckpoint()
+	if err := s.checkpointManager.GetCheckpoint(DriverPluginCheckpointFile, checkpoint); err != nil {
+		return fmt.Errorf("unable to sync from checkpoint: %w", err)
+	}
+	preparedClaims := checkpoint.V1.PreparedClaims
+
+written := 0
+validClaimUIDs := make([]string, 0, len(preparedClaims))
+for _, claimUID := range slices.Sorted(maps.Keys(preparedClaims)) {
+	preparedDevices := preparedClaims[claimUID]
+	if err := s.validatePreparedDevices(claimUID, preparedDevices); err != nil {
+		// One claim naming a device this driver can no longer see must not
+		// stop the driver from serving every other claim on the node, so
+		// this is logged rather than returned. The claim keeps its
+		// checkpoint entry and no spec file, and the next Prepare for it
+		// fails with this same error, which is where the kubelet can put it on the pod.
+		logger.Error(err, "Not regenerating the CDI spec for a checkpointed claim", "uid", claimUID)
+		continue
+	}
+	validClaimUIDs = append(validClaimUIDs, claimUID)
+	if err := s.cdi.CreateClaimSpecFile(claimUID, preparedDevices); err != nil {
+		return fmt.Errorf("unable to create CDI spec file for claim %v: %w", claimUID, err)
+	}
+	written++
+}
+
+removed, err := s.cdi.PruneClaimSpecFiles(validClaimUIDs)
+	if err != nil {
+		return err
+	}
+	if len(removed) > 0 {
+		logger.Info("Removed CDI spec files no checkpointed claim accounts for", "specs", removed)
+	}
+
+	logger.Info("Reconciled CDI spec files with the checkpoint",
+		"preparedClaims", len(preparedClaims),
+		"specsWritten", written,
+		"specsRemoved", len(removed),
+		"duration", time.Since(start),
+	)
+	return nil
 }
 
 // enumerateDevicesWithRetry calls profile.EnumerateDevices, retrying with
@@ -259,15 +320,32 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 	checkpointRead := time.Since(readStart)
 	preparedClaims := checkpoint.V1.PreparedClaims
 
-	if preparedClaims[claimUID] != nil {
-		logger.V(2).Info("Claim is already prepared; returning the checkpointed devices",
+	if preparedDevices := preparedClaims[claimUID]; preparedDevices != nil {
+		if err := s.validatePreparedDevices(claimUID, preparedDevices); err != nil {
+			return nil, err
+		}
+
+		// The checkpoint says this claim is prepared, but it outlives the CDI
+		// root across a node reboot, so the spec file the runtime resolves the
+		// returned CDI device names against may no longer exist. The spec is a
+		// pure function of the checkpointed devices, so rewriting it is cheap
+		// and idempotent; not rewriting it means handing the kubelet device
+		// names that resolve to nothing.
+		specStart := time.Now()
+		if err := s.cdi.CreateClaimSpecFile(claimUID, preparedDevices); err != nil {
+			return nil, fmt.Errorf("unable to recreate CDI spec file for claim: %v", err)
+		}
+		cdiSpecWrite := time.Since(specStart)
+
+		logger.V(2).Info("Claim is already prepared; rewrote its CDI spec and returned the checkpointed devices",
 			"uid", claimUID,
 			"preparedClaims", len(preparedClaims),
 			"lockWait", lockWait,
 			"checkpointRead", checkpointRead,
+			"cdiSpecWrite", cdiSpecWrite,
 			"duration", time.Since(callStart),
 		)
-		return preparedClaims[claimUID].GetDevices(), nil
+		return preparedDevices.GetDevices(), nil
 	}
 
 	preparedDevices, err := s.prepareDevices(claim)
@@ -439,6 +517,26 @@ func (s *DeviceState) prepareDevices(claim *resourceapi.ResourceClaim) (profiles
 	}
 
 	return preparedDevices, nil
+}
+
+// validatePreparedDevices checks that every device a checkpoint entry records
+// for a claim is still one this driver enumerated at startup.
+//
+// The checkpoint survives a reboot, the enumeration does not: a chip that
+// stopped responding, or a board that was pulled, leaves entries naming
+// devices that are gone. Regenerating a CDI spec from such an entry would
+// inject a device node that does not exist on the host, and the only symptom
+// would be whatever the workload makes of the missing node. Reporting the
+// device by name here instead puts the reason on the pod, matching what
+// prepareDevices does for a freshly allocated claim.
+func (s *DeviceState) validatePreparedDevices(claimUID string, preparedDevices profiles.PreparedDevices) error {
+	for _, device := range preparedDevices {
+		if _, exists := s.allocatable[device.DeviceName]; !exists {
+			return fmt.Errorf("device %v prepared for claim %v is no longer allocatable (the driver enumerated %d device(s) at startup: %v)",
+				device.DeviceName, claimUID, len(s.allocatable), slices.Sorted(maps.Keys(s.allocatable)))
+		}
+	}
+	return nil
 }
 
 func (s *DeviceState) unprepareDevices(_ string, _ profiles.PreparedDevices) error {

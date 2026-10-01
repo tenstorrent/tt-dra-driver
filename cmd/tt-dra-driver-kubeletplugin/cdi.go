@@ -24,7 +24,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
@@ -38,9 +40,15 @@ const cdiCommonDeviceName = "common"
 
 var nonWord = regexp.MustCompile(`[^a-zA-Z0-9]+`)
 
+// cdiSpecExtensions are the file extensions a CDI spec can be written with.
+// The driver only ever writes the default (YAML), but a spec left behind by
+// an older version of the driver could carry either.
+var cdiSpecExtensions = []string{".yaml", ".json"}
+
 // CDIHandler manages the on-disk CDI specs published by the driver.
 type CDIHandler struct {
 	cache       *cdiapi.Cache
+	root        string
 	driverName  string
 	class       string
 	commonEdits *cdiapi.ContainerEdits
@@ -60,6 +68,7 @@ func NewCDIHandler(root, driverName, class string, commonEdits *cdiapi.Container
 	}
 	return &CDIHandler{
 		cache:       cache,
+		root:        root,
 		driverName:  driverName,
 		class:       class,
 		commonEdits: commonEdits,
@@ -96,18 +105,16 @@ func (cdi *CDIHandler) CreateCommonSpecFile() error {
 	}
 	spec.Version = minVersion
 
-	specName, err := cdiapi.GenerateNameForTransientSpec(spec, cdiCommonDeviceName)
-	if err != nil {
-		return fmt.Errorf("failed to generate Spec name: %w", err)
-	}
-
-	return cdi.cache.WriteSpec(spec, specName)
+	return cdi.cache.WriteSpec(spec, cdi.claimSpecName(cdiCommonDeviceName))
 }
 
 // CreateClaimSpecFile writes the per-claim CDI spec that the kubelet will
-// reference when injecting devices into containers.
+// reference when injecting devices into containers. The spec is derived
+// entirely from its arguments, so calling it again with the same claim and
+// devices rewrites the same content; the driver relies on that to restore a
+// spec file that was lost with the CDI root (see DeviceState.Prepare).
 func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, devices profiles.PreparedDevices) error {
-	specName := cdiapi.GenerateTransientSpecName(cdi.vendor(), cdi.class, claimUID)
+	specName := cdi.claimSpecName(claimUID)
 
 	spec := &cdispec.Spec{
 		Kind:    cdi.kind(),
@@ -145,10 +152,62 @@ func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, devices profiles.Pre
 	return cdi.cache.WriteSpec(spec, specName)
 }
 
-// DeleteClaimSpecFile removes the per-claim CDI spec from disk.
+// DeleteClaimSpecFile removes the per-claim CDI spec from disk. A spec that
+// is already gone is not an error.
 func (cdi *CDIHandler) DeleteClaimSpecFile(claimUID string) error {
-	specName := cdiapi.GenerateTransientSpecName(cdi.vendor(), cdi.class, claimUID)
-	return cdi.cache.RemoveSpec(specName)
+	return cdi.cache.RemoveSpec(cdi.claimSpecName(claimUID))
+}
+
+// PruneClaimSpecFiles removes every per-claim CDI spec in the CDI root that
+// does not belong to one of the given claim UIDs, and returns the names of the
+// files it removed. The driver's own common spec and any spec belonging to
+// another vendor or class are left alone.
+//
+// Prepare writes the CDI spec before it checkpoints the claim, so a driver
+// that dies between the two leaves a spec file no claim accounts for. Those
+// files are inert but they accumulate, and a stale one can outlive the device
+// it names.
+func (cdi *CDIHandler) PruneClaimSpecFiles(claimUIDs []string) ([]string, error) {
+	prefix := cdiapi.GenerateSpecName(cdi.vendor(), cdi.class) + "_"
+
+	keep := map[string]struct{}{
+		cdi.claimSpecName(cdiCommonDeviceName): {},
+	}
+	for _, claimUID := range claimUIDs {
+		keep[cdi.claimSpecName(claimUID)] = struct{}{}
+	}
+
+	entries, err := os.ReadDir(cdi.root)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read the CDI root %q: %w", cdi.root, err)
+	}
+
+	var removed []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		ext := filepath.Ext(name)
+		if !slices.Contains(cdiSpecExtensions, ext) {
+			continue
+		}
+		specName := strings.TrimSuffix(name, ext)
+		if !strings.HasPrefix(specName, prefix) {
+			continue
+		}
+if ext == ".yaml" {
+			if _, ok := keep[specName]; ok {
+				continue
+			}
+		}
+		if err := cdi.cache.RemoveSpec(name); err != nil {
+			return removed, fmt.Errorf("unable to remove the orphaned CDI spec %q: %w", name, err)
+		}
+		removed = append(removed, name)
+	}
+
+	return removed, nil
 }
 
 // GetClaimDevices returns the qualified CDI device IDs that the kubelet
@@ -162,6 +221,12 @@ func (cdi *CDIHandler) GetClaimDevices(claimUID string, devices []string) []stri
 		cdiDevices = append(cdiDevices, cdiDevice)
 	}
 	return cdiDevices
+}
+
+// claimSpecName returns the extensionless name of the CDI spec file that
+// holds the devices of the given claim.
+func (cdi *CDIHandler) claimSpecName(claimUID string) string {
+	return cdiapi.GenerateTransientSpecName(cdi.vendor(), cdi.class, claimUID)
 }
 
 func (cdi *CDIHandler) kind() string {
