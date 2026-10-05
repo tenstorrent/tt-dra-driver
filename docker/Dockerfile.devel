@@ -17,4 +17,11 @@
 ARG GOLANG_VERSION=x.x.x
 FROM golang:${GOLANG_VERSION}
 
-RUN go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+# Pinned by GOLANGCI_LINT_VERSION in common.mk so that this image, a local
+# `make lint` and CI all agree on the findings.
+#
+# Note the /v2/ in the module path: golangci-lint carries its major version
+# there, so installing from the unversioned path silently pins v1, which cannot
+# read the version 2 config in .golangci.yaml.
+ARG GOLANGCI_LINT_VERSION=latest
+RUN go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}

@@ -183,27 +183,27 @@ func (s *DeviceState) reconcileCDISpecs(ctx context.Context) error {
 	}
 	preparedClaims := checkpoint.V1.PreparedClaims
 
-written := 0
-validClaimUIDs := make([]string, 0, len(preparedClaims))
-for _, claimUID := range slices.Sorted(maps.Keys(preparedClaims)) {
-	preparedDevices := preparedClaims[claimUID]
-	if err := s.validatePreparedDevices(claimUID, preparedDevices); err != nil {
-		// One claim naming a device this driver can no longer see must not
-		// stop the driver from serving every other claim on the node, so
-		// this is logged rather than returned. The claim keeps its
-		// checkpoint entry and no spec file, and the next Prepare for it
-		// fails with this same error, which is where the kubelet can put it on the pod.
-		logger.Error(err, "Not regenerating the CDI spec for a checkpointed claim", "uid", claimUID)
-		continue
+	written := 0
+	validClaimUIDs := make([]string, 0, len(preparedClaims))
+	for _, claimUID := range slices.Sorted(maps.Keys(preparedClaims)) {
+		preparedDevices := preparedClaims[claimUID]
+		if err := s.validatePreparedDevices(claimUID, preparedDevices); err != nil {
+			// One claim naming a device this driver can no longer see must not
+			// stop the driver from serving every other claim on the node, so
+			// this is logged rather than returned. The claim keeps its
+			// checkpoint entry and no spec file, and the next Prepare for it
+			// fails with this same error, which is where the kubelet can put it on the pod.
+			logger.Error(err, "Not regenerating the CDI spec for a checkpointed claim", "uid", claimUID)
+			continue
+		}
+		validClaimUIDs = append(validClaimUIDs, claimUID)
+		if err := s.cdi.CreateClaimSpecFile(claimUID, preparedDevices); err != nil {
+			return fmt.Errorf("unable to create CDI spec file for claim %v: %w", claimUID, err)
+		}
+		written++
 	}
-	validClaimUIDs = append(validClaimUIDs, claimUID)
-	if err := s.cdi.CreateClaimSpecFile(claimUID, preparedDevices); err != nil {
-		return fmt.Errorf("unable to create CDI spec file for claim %v: %w", claimUID, err)
-	}
-	written++
-}
 
-removed, err := s.cdi.PruneClaimSpecFiles(validClaimUIDs)
+	removed, err := s.cdi.PruneClaimSpecFiles(validClaimUIDs)
 	if err != nil {
 		return err
 	}

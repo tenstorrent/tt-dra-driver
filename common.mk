@@ -17,6 +17,14 @@
 
 GOLANG_VERSION ?= 1.26.2
 
+# golangci-lint version used by `make lint`, by the development image and by
+# CI, so that all three report the same findings.
+#
+# Two constraints on changing it: the major version has to match the `version:`
+# field in .golangci.yaml, and the release has to be built with a Go no older
+# than the `go` directive in go.mod, otherwise it refuses to load the config.
+GOLANGCI_LINT_VERSION ?= v2.14.0
+
 DRIVER_NAME := tt-dra-driver
 MODULE := github.com/tenstorrent/$(DRIVER_NAME)
 

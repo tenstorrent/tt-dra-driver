@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+name: check
+
+# Static analysis gate for the Go sources: formatting, vet and golangci-lint,
+# the same three checks `make check` runs locally.
+#
+# This runs on every pull request, which is the point: before it existed the
+# only workflow triggered on pushes to main and on tags, and it built the image
+# and the chart without ever running the checks. Everything in .golangci.yaml
+# was therefore advisory, enforced only by whoever remembered to run it.
+#
+# The linter is installed through `make install-lint` at the version pinned in
+# common.mk, so this job, a local checkout and the containerised
+# `make docker-check` path all report the same findings.
+#
+# Each check is its own step rather than a single `make check`, so a red run
+# names the failure in the job summary without needing the log opened.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Go version comes from go.mod so that it cannot drift from what the
+      # module targets. golangci-lint refuses to load a config whose target Go
+      # version is newer than the toolchain it was built with, so this also
+      # keeps the linter installable.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install golangci-lint
+        run: make install-lint
+
+      - name: Check formatting
+        run: make assert-fmt
+
+      - name: Vet
+        run: make vet
+
+      - name: Lint
+        run: make lint

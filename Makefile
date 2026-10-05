@@ -107,8 +107,20 @@ assert-fmt:
 		rm fmt.out; \
 	fi
 
+# Prefer a golangci-lint already on PATH, which is how the development image
+# provides it, and otherwise fall back to GOPATH/bin where `make install-lint`
+# puts it. Without the fallback, `make lint` straight after `make install-lint`
+# fails on any machine that does not have GOPATH/bin on its PATH.
+GOLANGCI_LINT ?= $(shell command -v golangci-lint 2>/dev/null || echo $$(go env GOPATH)/bin/golangci-lint)
+
 lint:
-	golangci-lint run ./...
+	$(GOLANGCI_LINT) run ./...
+
+# Install the pinned golangci-lint into $(go env GOPATH)/bin. The development
+# image bakes it in already; this is for a local checkout and for CI.
+.PHONY: install-lint
+install-lint:
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 
 vet:
 	go vet $(MODULE)/...
@@ -128,6 +140,7 @@ coverage: test
 		$(CONTAINER_TOOL) build \
 			--progress=plain \
 			--build-arg GOLANG_VERSION="$(GOLANG_VERSION)" \
+			--build-arg GOLANGCI_LINT_VERSION="$(GOLANGCI_LINT_VERSION)" \
 			--tag $(BUILDIMAGE) \
 			-f $(^) \
 			docker; \
