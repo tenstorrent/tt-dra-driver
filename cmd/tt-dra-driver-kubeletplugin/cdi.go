@@ -196,7 +196,7 @@ func (cdi *CDIHandler) PruneClaimSpecFiles(claimUIDs []string) ([]string, error)
 		if !strings.HasPrefix(specName, prefix) {
 			continue
 		}
-if ext == ".yaml" {
+		if ext == ".yaml" {
 			if _, ok := keep[specName]; ok {
 				continue
 			}
