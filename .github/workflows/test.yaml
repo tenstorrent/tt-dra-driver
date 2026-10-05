@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+name: test
+
+# Runs the Go test suite on every pull request, alongside the static checks in
+# check.yaml.
+#
+# Both kinds of test live in the kubelet plugin package, so a single invocation
+# covers both: the unit tests around DeviceState, the checkpoint and the CDI
+# handler, and the end-to-end smoke suite that starts a real driver against a
+# fake fabric manager agent and drives it over the two gRPC sockets the kubelet
+# uses. Neither kind needs Tenstorrent hardware or a Kubernetes cluster, which
+# is what lets this run on a plain GitHub runner.
+#
+# -race is set here but left out of the default `make test`, so that a local
+# run stays as quick as possible while CI gets the stricter check. It is worth
+# it because the driver is a concurrent daemon -- DeviceState is mutex-guarded
+# and ResourceSlice publishing happens on a background controller -- and the
+# end-to-end harness drives it from several goroutines at once. The cost is
+# small: the suite's wall time is dominated by the publish sync delay rather
+# than by CPU, so the detector barely lengthens it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go tests
+    runs-on: ubuntu-latest
+    # The suite takes well under a minute. This is only here so that a wedged
+    # socket wait fails the run instead of occupying a runner for hours.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # From go.mod, so the toolchain cannot drift from what the module
+      # targets. Matches check.yaml.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      # `make test` builds the packages and the command binaries first, so this
+      # step also covers compilation for the driver's GOOS.
+      - name: Test
+        run: make test TESTFLAGS=-race
+
+      # Read from the profile the step above wrote. `make coverage` would be
+      # the obvious call, but it declares `test` as a prerequisite and would
+      # therefore run the whole suite a second time.
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out

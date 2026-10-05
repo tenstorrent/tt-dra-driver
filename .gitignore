@@ -10,6 +10,10 @@ vendor/
 driver_image.tar
 *.tgz
 
+# Test and check artifacts
+/coverage.out
+/fmt.out
+
 # Editor/OS noise
 .DS_Store
 .idea/

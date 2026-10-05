@@ -125,9 +125,13 @@ install-lint:
 vet:
 	go vet $(MODULE)/...
 
+# Extra flags for `go test`, e.g. `make test TESTFLAGS=-race`. CI sets -race;
+# see .github/workflows/test.yaml for why.
+TESTFLAGS ?=
+
 COVERAGE_FILE := coverage.out
 test: build cmds
-	go test -v -coverprofile=$(COVERAGE_FILE) $(MODULE)/...
+	go test $(TESTFLAGS) -v -coverprofile=$(COVERAGE_FILE) $(MODULE)/...
 
 coverage: test
 	go tool cover -func=$(COVERAGE_FILE)
