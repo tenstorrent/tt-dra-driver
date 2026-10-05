@@ -582,7 +582,7 @@ func GetOpaqueDeviceConfigs(
 			return nil, fmt.Errorf("invalid config source: %v", config.Source)
 		}
 	}
-	candidateConfigs := append(classConfigs, claimConfigs...)
+	candidateConfigs := slices.Concat(classConfigs, claimConfigs)
 
 	var resultConfigs []*OpaqueDeviceConfig
 	for _, config := range candidateConfigs {
