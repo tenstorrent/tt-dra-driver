@@ -45,10 +45,12 @@ import (
 )
 
 // enumerateBackoff bounds how long NewDeviceState waits for the fabric
-// manager agent to finish its initial topology discovery before failing the
-// driver probe. With Factor=1.5, Cap=30s, Steps=20 this caps out at roughly
-// five minutes of total wall time, which comfortably covers observed FM
-// agent startup latencies while still surfacing a hung agent.
+// manager agent to become usable before failing the driver probe. With
+// Factor=1.5, Cap=30s, Steps=20 the sleeps alone cap out at roughly five
+// minutes of wall time, which comfortably covers observed FM agent startup
+// latencies. Each attempt also carries the client's per-call deadline
+// (fabricmanager.DefaultRPCTimeout), so a wedged agent adds at most a
+// further Steps*timeout on top instead of blocking forever.
 var enumerateBackoff = wait.Backoff{
 	Duration: 1 * time.Second,
 	Factor:   1.5,
@@ -221,12 +223,14 @@ func (s *DeviceState) reconcileCDISpecs(ctx context.Context) error {
 }
 
 // enumerateDevicesWithRetry calls profile.EnumerateDevices, retrying with
-// exponential backoff while the fabric manager agent is still discovering
-// its topology (i.e. while it returns fabricmanager.ErrTopologyNotReady).
-// Any other error is returned immediately. The retry budget is bounded by
-// enumerateBackoff; once exhausted the last not-ready error is surfaced so
-// the kubelet probe fails rather than the driver publishing an empty
-// ResourceSlice.
+// exponential backoff while the fabric manager agent is not yet usable:
+// either it has not finished topology discovery
+// (fabricmanager.ErrTopologyNotReady) or it is not answering at all
+// (fabricmanager.ErrAgentUnavailable, e.g. the agent pod is still starting,
+// restarting or wedged). Any other error is returned immediately. The retry
+// budget is bounded by enumerateBackoff; once exhausted the last transient
+// error is surfaced so the kubelet probe fails rather than the driver
+// publishing an empty ResourceSlice.
 func enumerateDevicesWithRetry(ctx context.Context, profile profiles.Profile) (resourceslice.DriverResources, error) {
 	logger := klog.FromContext(ctx)
 	logger.Info("Enumerating devices from the fabric manager agent")
@@ -237,7 +241,7 @@ func enumerateDevicesWithRetry(ctx context.Context, profile profiles.Profile) (r
 	var driverResources resourceslice.DriverResources
 	err := retry.OnError(
 		enumerateBackoff,
-		func(err error) bool { return errors.Is(err, fabricmanager.ErrTopologyNotReady) },
+		transientEnumerateError,
 		func() error {
 			attempts++
 			attemptStart := time.Now()
@@ -252,6 +256,13 @@ func enumerateDevicesWithRetry(ctx context.Context, profile profiles.Profile) (r
 					"attempt", attempts,
 					"attemptDuration", time.Since(attemptStart),
 					"elapsed", time.Since(start),
+				)
+			case errors.Is(err, fabricmanager.ErrAgentUnavailable):
+				logger.Info("Fabric manager agent is not answering; will retry",
+					"attempt", attempts,
+					"attemptDuration", time.Since(attemptStart),
+					"elapsed", time.Since(start),
+					"err", err,
 				)
 			default:
 				// Not retried by the predicate above, but worth the same
@@ -291,6 +302,13 @@ func countDevices(driverResources resourceslice.DriverResources) int {
 		}
 	}
 	return total
+}
+
+// transientEnumerateError reports whether an EnumerateDevices failure is one
+// the driver should wait out rather than exit on.
+func transientEnumerateError(err error) bool {
+	return errors.Is(err, fabricmanager.ErrTopologyNotReady) ||
+		errors.Is(err, fabricmanager.ErrAgentUnavailable)
 }
 
 // Prepare reserves devices for a claim, materializes the per-claim CDI spec
