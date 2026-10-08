@@ -30,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -283,48 +284,56 @@ func TestSmokeDropsTrayWithoutAnMMIOPeer(t *testing.T) {
 
 // TestSmokeWaitsForTopologyDiscovery covers the startup race the driver is
 // built to tolerate: the fabric manager agent is reachable but has not
-// finished discovering its own hardware yet. The driver must retry rather than
-// publish an empty ResourceSlice, which the scheduler would read as a node
-// with no Tenstorrent devices.
+// finished discovering its own hardware yet. The driver must wait for a
+// usable topology rather than publish an empty ResourceSlice, which the
+// scheduler would read as a node with no Tenstorrent devices.
 func TestSmokeWaitsForTopologyDiscovery(t *testing.T) {
-	shortenEnumerateBackoff(t)
-
 	h := newHarness(t, withTopology(n150Topology()))
-	h.agent.setNotReady(3)
+	h.agent.setDiscovering(true)
+
+	// The agent finishes discovering only after the driver is already
+	// watching, so the watch has to carry the driver across the gap.
+	discovered := time.AfterFunc(50*time.Millisecond, func() { h.agent.setDiscovering(false) })
+	defer discovered.Stop()
+
+	start := time.Now()
 	h.start()
 
-	if got := h.agent.callCount(); got < 4 {
-		t.Errorf("the agent served %d GetTopology calls, want at least 4", got)
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+		t.Errorf("the driver came up after %v, before the agent finished discovering", elapsed)
 	}
 	h.waitForPublishedDevices("tt-0")
 }
 
 // TestSmokeFailsWhenTheAgentNeverFinishesDiscovery checks the other end of the
-// retry budget: once it is exhausted the driver fails instead of coming up
-// with nothing to offer.
+// wait: once it is exhausted the driver fails instead of coming up with
+// nothing to offer.
 func TestSmokeFailsWhenTheAgentNeverFinishesDiscovery(t *testing.T) {
-	shortenEnumerateBackoff(t)
+	shortenInitialDevicesTimeout(t)
 
 	h := newHarness(t, withTopology(n150Topology()))
-	h.agent.setNotReady(1 << 30)
+	h.agent.setDiscovering(true)
 
 	err := h.startErr()
 	if err == nil {
 		t.Fatal("the driver started while the agent was still discovering")
 	}
-	if !strings.Contains(err.Error(), "topology not yet discovered") {
-		t.Errorf("the error does not explain the agent was not ready: %v", err)
+	if !strings.Contains(err.Error(), "no devices reported within") {
+		t.Errorf("the error does not explain that nothing was reported in time: %v", err)
+	}
+	if devices := h.publishedDevicesNow(); len(devices) > 0 {
+		t.Errorf("the driver published %v despite never being told about any", deviceNames(devices))
 	}
 }
 
-// TestSmokeFailsWhenTheAgentIsUnreachable covers a down or misaddressed agent.
-// Because grpc.NewClient connects lazily, this is the first call that notices.
-// An unreachable agent is retried — it may just be starting — but once the
-// budget is exhausted the failure has to be loud: the kubelet probe failing
-// and the driver crashlooping is the intended outcome.
+// TestSmokeFailsWhenTheAgentIsUnreachable covers a down or misaddressed
+// agent. Because grpc.NewClient connects lazily, the watch is the first thing
+// that notices, and it keeps reconnecting in case the agent is merely slow to
+// start. Once the wait for the first devices runs out the failure has to be
+// loud: the kubelet probe failing and the driver crashlooping is the intended
+// outcome.
 func TestSmokeFailsWhenTheAgentIsUnreachable(t *testing.T) {
-	// Exhaust the retry budget in milliseconds rather than minutes.
-	withFastBackoff(t, 3)
+	shortenInitialDevicesTimeout(t)
 
 	// A port nothing listens on: taken and released, so it is free.
 	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t)))
@@ -334,8 +343,8 @@ func TestSmokeFailsWhenTheAgentIsUnreachable(t *testing.T) {
 	if err == nil {
 		t.Fatal("the driver started without a reachable fabric manager agent")
 	}
-	if !strings.Contains(err.Error(), "GetTopology") {
-		t.Errorf("the error does not name the failing call: %v", err)
+	if !strings.Contains(err.Error(), "no devices reported within") {
+		t.Errorf("the error does not explain that nothing was reported in time: %v", err)
 	}
 	if devices := h.publishedDevicesNow(); len(devices) > 0 {
 		t.Errorf("the driver published %v despite failing to enumerate", deviceNames(devices))
@@ -356,9 +365,9 @@ func TestSmokeSurfacesAnUnexpectedAgentStatus(t *testing.T) {
 	if !strings.Contains(err.Error(), "discovery exploded") {
 		t.Errorf("the error does not carry the agent's reason: %v", err)
 	}
-	// One attempt only: an Internal error is not the retryable not-ready case.
-	if got := h.agent.callCount(); got != 1 {
-		t.Errorf("the agent served %d calls, want exactly 1 with no retries", got)
+	// One attempt only: an Internal error is not one a reconnect can fix.
+	if got := h.agent.watchCount(); got != 1 {
+		t.Errorf("the agent served %d watches, want exactly 1 with no reconnects", got)
 	}
 }
 
