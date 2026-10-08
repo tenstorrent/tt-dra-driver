@@ -69,7 +69,9 @@ kubeletPlugin:
     plugin:
       securityContext:
         privileged: true
-      resources: {}
+      resources:
+        requests:
+          ephemeral-storage: 250Mi
       # Port for the gRPC liveness service. Set to a negative value to
       # disable the service and the probe.
       healthcheckPort: 51515
