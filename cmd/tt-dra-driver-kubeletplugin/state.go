@@ -76,7 +76,7 @@ type DeviceState struct {
 // handler and loading any previously persisted checkpoint. Later sets are
 // folded in with SetResources.
 func NewDeviceState(ctx context.Context, config *Config, driverResources resourceslice.DriverResources) (*DeviceState, error) {
-	cdi, err := NewCDIHandler(config.flags.cdiRoot, config.flags.driverName, config.flags.profile, config.profile.CommonContainerEdits())
+	cdi, err := NewCDIHandler(config.flags.cdiRoot, config.flags.driverName, config.flags.profile, config.flags.nodeName, config.profile.CommonContainerEdits())
 	if err != nil {
 		return nil, fmt.Errorf("unable to create CDI handler: %v", err)
 	}
