@@ -37,6 +37,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
@@ -445,6 +446,32 @@ func (h *harness) allocate(uid string, deviceNames ...string) *resourceapi.Resou
 	h.t.Helper()
 
 	claim := newTestClaim(uid, deviceNames...)
+	if _, err := h.client.ResourceV1().ResourceClaims(claim.Namespace).
+		Create(h.ctx, claim, metav1.CreateOptions{}); err != nil {
+		h.t.Fatalf("create the resource claim %s: %v", uid, err)
+	}
+	return claim
+}
+
+// allocateWithConfig creates an allocated ResourceClaim that also carries an
+// opaque configuration, as a claim or a DeviceClass with a config stanza
+// produces. driver is who the configuration is addressed to, which is how a
+// claim spanning several drivers keeps their parameters apart.
+func (h *harness) allocateWithConfig(uid, driver, parameters string, deviceNames ...string) *resourceapi.ResourceClaim {
+	h.t.Helper()
+
+	claim := newTestClaim(uid, deviceNames...)
+	claim.Status.Allocation.Devices.Config = []resourceapi.DeviceAllocationConfiguration{
+		{
+			Source: resourceapi.AllocationConfigSourceClaim,
+			DeviceConfiguration: resourceapi.DeviceConfiguration{
+				Opaque: &resourceapi.OpaqueDeviceConfiguration{
+					Driver:     driver,
+					Parameters: runtime.RawExtension{Raw: []byte(parameters)},
+				},
+			},
+		},
+	}
 	if _, err := h.client.ResourceV1().ResourceClaims(claim.Namespace).
 		Create(h.ctx, claim, metav1.CreateOptions{}); err != nil {
 		h.t.Fatalf("create the resource claim %s: %v", uid, err)
