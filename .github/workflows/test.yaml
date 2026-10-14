@@ -59,5 +59,12 @@ jobs:
       # Read from the profile the step above wrote. `make coverage` would be
       # the obvious call, but it declares `test` as a prerequisite and would
       # therefore run the whole suite a second time.
+      #
+      # The profile is measured across the module rather than per package, so
+      # this total is the union over every test: code the end-to-end suite
+      # drives through the fabric manager client and the Tenstorrent profile
+      # counts for those packages. The per-package percentages `go test`
+      # prints above are each only one test binary's share of that same set,
+      # and are not the number to read.
       - name: Coverage summary
         run: go tool cover -func=coverage.out
