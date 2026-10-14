@@ -6,12 +6,12 @@ name: test
 # Runs the Go test suite on every pull request, alongside the static checks in
 # check.yaml.
 #
-# Both kinds of test live in the kubelet plugin package, so a single invocation
-# covers both: the unit tests around DeviceState, the checkpoint and the CDI
-# handler, and the end-to-end smoke suite that starts a real driver against a
-# fake fabric manager agent and drives it over the two gRPC sockets the kubelet
-# uses. Neither kind needs Tenstorrent hardware or a Kubernetes cluster, which
-# is what lets this run on a plain GitHub runner.
+# A single invocation covers every kind: the unit tests around DeviceState,
+# the checkpoint and the CDI handler; the end-to-end smoke suite that starts a
+# real driver against a fake fabric manager agent and drives it over the two
+# gRPC sockets the kubelet uses; and the chart render tests under test/chart.
+# None of them needs Tenstorrent hardware or a Kubernetes cluster, which is
+# what lets this run on a plain GitHub runner.
 #
 # -race is set here but left out of the default `make test`, so that a local
 # run stays as quick as possible while CI gets the stricter check. It is worth
@@ -50,6 +50,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+
+      # The chart render tests compare `helm template` output against checked-in
+      # manifests, and skip themselves when helm is missing -- which would make
+      # them silently stop covering anything here. The version is pinned
+      # because the golden files are byte-exact: bump it in step with
+      # goldenHelmMajor and a regenerated testdata directory.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.1.4
 
       # `make test` builds the packages and the command binaries first, so this
       # step also covers compilation for the driver's GOOS.

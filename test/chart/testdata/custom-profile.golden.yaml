@@ -1,0 +1,186 @@
+---
+# Source: tt-dra-driver/templates/serviceaccount.yaml
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tt-dra-driver-service-account
+  namespace: tt-dra-driver
+  labels:
+    helm.sh/chart: tt-dra-driver-0.0.0-dev
+    app.kubernetes.io/name: tt-dra-driver
+    app.kubernetes.io/instance: tt-dra-driver
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+---
+# Source: tt-dra-driver/templates/clusterrole.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: tt-dra-driver-role
+  namespace: tt-dra-driver
+rules:
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceslices"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Source: tt-dra-driver/templates/clusterrolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: tt-dra-driver-role-binding
+  namespace: tt-dra-driver
+subjects:
+- kind: ServiceAccount
+  name: tt-dra-driver-service-account
+  namespace: tt-dra-driver
+roleRef:
+  kind: ClusterRole
+  name: tt-dra-driver-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Source: tt-dra-driver/templates/kubeletplugin.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tt-dra-driver-kubeletplugin
+  namespace: tt-dra-driver
+  labels:
+    helm.sh/chart: tt-dra-driver-0.0.0-dev
+    app.kubernetes.io/name: tt-dra-driver
+    app.kubernetes.io/instance: tt-dra-driver
+    app.kubernetes.io/version: "latest"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: kubeletplugin
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tt-dra-driver
+      app.kubernetes.io/instance: tt-dra-driver
+      app.kubernetes.io/component: kubeletplugin
+  updateStrategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tt-dra-driver
+        app.kubernetes.io/instance: tt-dra-driver
+        app.kubernetes.io/component: kubeletplugin
+    spec:
+      priorityClassName: system-node-critical
+      imagePullSecrets:
+        - name: tt-dra-driver
+      serviceAccountName: tt-dra-driver-service-account
+      securityContext:
+        {}
+      containers:
+      - name: plugin
+        securityContext:
+          privileged: true
+        image: ghcr.io/tenstorrent/tt-dra-driver:latest
+        imagePullPolicy: IfNotPresent
+        command: ["tt-dra-driver-kubeletplugin"]
+        resources:
+          {}
+        
+        livenessProbe:
+          grpc:
+            port: 51515
+            service: liveness
+          failureThreshold: 3
+          periodSeconds: 10
+        env:
+        - name: DRIVER_NAME
+          value: "example.tenstorrent.com"
+        - name: DEVICE_PROFILE
+          value: "example"
+        - name: CDI_ROOT
+          value: /var/run/cdi
+        - name: KUBELET_REGISTRAR_DIRECTORY_PATH
+          value: "/var/lib/kubelet/plugins_registry"
+        - name: KUBELET_PLUGINS_DIRECTORY_PATH
+          value: "/var/lib/kubelet/plugins"
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        # Address (host:port) of the per-node Tenstorrent Fabric Manager
+        # agent. The kubelet plugin uses it to discover the local ASICs.
+        - name: FABRIC_MANAGER_AGENT_ADDRESS
+          value: "tt-fabric-manager-agent.ttfm.svc.cluster.local:50053"
+        - name: HEALTHCHECK_PORT
+          value: "51515"
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        volumeMounts:
+        - name: plugins-registry
+          mountPath: "/var/lib/kubelet/plugins_registry"
+        - name: plugins
+          mountPath: "/var/lib/kubelet/plugins"
+        - name: cdi
+          mountPath: /var/run/cdi
+      volumes:
+      - name: plugins-registry
+        hostPath:
+          path: "/var/lib/kubelet/plugins_registry"
+      - name: plugins
+        hostPath:
+          path: "/var/lib/kubelet/plugins"
+      - name: cdi
+        hostPath:
+          path: /var/run/cdi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: tenstorrent.com/has-tt
+                    operator: In
+                    values: ["true"]
+              - matchExpressions:
+                  - key: feature.node.kubernetes.io/pci-1200_1e52.present
+                    operator: In
+                    values: ["true"]
+---
+# Source: tt-dra-driver/templates/clusterrole.yaml
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+---
+# Source: tt-dra-driver/templates/clusterrolebinding.yaml
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+---
+# Source: tt-dra-driver/templates/deviceclass.yaml
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+---
+# Source: tt-dra-driver/templates/kubeletplugin.yaml
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+---
+# Source: tt-dra-driver/templates/deviceclass.yaml
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: example.tenstorrent.com
+spec:
+  extendedResourceName: tenstorrent.com/chip
+  selectors:
+  - cel:
+      expression: "device.driver == 'example.tenstorrent.com'"
