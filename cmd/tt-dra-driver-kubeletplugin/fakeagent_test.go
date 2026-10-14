@@ -26,6 +26,8 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	agentpb "github.com/tenstorrent/tt-dra-driver/internal/fabricmanager/proto/agent"
 	topologypb "github.com/tenstorrent/tt-dra-driver/internal/fabricmanager/proto/topology"
@@ -53,10 +55,22 @@ type fakeAgent struct {
 	version  uint64
 	watches  int
 
-	// subs holds one queue per open WatchTopology stream. Every state change
+	// subs holds one entry per open WatchTopology stream. Every state change
 	// fans a fresh snapshot out to all of them, the way the real agent
 	// re-reports to each watcher.
-	subs map[chan *agentpb.WatchTopologyResponse]struct{}
+	subs map[*watchStream]struct{}
+}
+
+// watchStream is the agent's side of one open WatchTopology stream.
+type watchStream struct {
+	// queue carries the snapshots the stream has yet to send. It is buffered
+	// so that a test changing the topology never blocks on a stream the driver
+	// has not drained yet.
+	queue chan *agentpb.WatchTopologyResponse
+
+	// fail ends the stream with an error, standing in for the agent dying or
+	// refusing to serve a watch it had already accepted.
+	fail chan error
 }
 
 // startFakeAgent serves the agent API on an unused loopback port for the
@@ -72,7 +86,7 @@ func startFakeAgent(t *testing.T, topology *topologypb.HostPhysicalTopology) *fa
 	agent := &fakeAgent{
 		addr:     listener.Addr().String(),
 		topology: topology,
-		subs:     make(map[chan *agentpb.WatchTopologyResponse]struct{}),
+		subs:     make(map[*watchStream]struct{}),
 	}
 
 	server := grpc.NewServer()
@@ -93,27 +107,29 @@ func startFakeAgent(t *testing.T, topology *topologypb.HostPhysicalTopology) *fa
 // protocol promises, and then carries one more for every change a test makes
 // afterwards.
 func (a *fakeAgent) WatchTopology(_ *agentpb.WatchTopologyRequest, stream agentpb.AgentService_WatchTopologyServer) error {
-	queue, err := a.subscribe()
+	sub, err := a.subscribe()
 	if err != nil {
 		return err
 	}
-	defer a.unsubscribe(queue)
+	defer a.unsubscribe(sub)
 
 	for {
 		select {
-		case resp := <-queue:
+		case resp := <-sub.queue:
 			if err := stream.Send(resp); err != nil {
 				return err
 			}
+		case err := <-sub.fail:
+			return err
 		case <-stream.Context().Done():
 			return stream.Context().Err()
 		}
 	}
 }
 
-// subscribe registers a queue for one stream and seeds it with the current
-// state, or reports the failure a test asked every stream to fail with.
-func (a *fakeAgent) subscribe() (chan *agentpb.WatchTopologyResponse, error) {
+// subscribe registers one stream and seeds it with the current state, or
+// reports the failure a test asked every stream to fail with.
+func (a *fakeAgent) subscribe() (*watchStream, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -122,19 +138,20 @@ func (a *fakeAgent) subscribe() (chan *agentpb.WatchTopologyResponse, error) {
 		return nil, a.rpcErr
 	}
 
-	// Buffered so that a test changing the topology never blocks on a stream
-	// the driver has not drained yet.
-	queue := make(chan *agentpb.WatchTopologyResponse, 16)
-	queue <- a.snapshotLocked()
-	a.subs[queue] = struct{}{}
-	return queue, nil
+	sub := &watchStream{
+		queue: make(chan *agentpb.WatchTopologyResponse, 16),
+		fail:  make(chan error, 1),
+	}
+	sub.queue <- a.snapshotLocked()
+	a.subs[sub] = struct{}{}
+	return sub, nil
 }
 
-func (a *fakeAgent) unsubscribe(queue chan *agentpb.WatchTopologyResponse) {
+func (a *fakeAgent) unsubscribe(sub *watchStream) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	delete(a.subs, queue)
+	delete(a.subs, sub)
 }
 
 // snapshotLocked renders the agent's current state as one stream message.
@@ -155,8 +172,8 @@ func (a *fakeAgent) snapshotLocked() *agentpb.WatchTopologyResponse {
 // broadcastLocked fans the current state out to every open stream.
 func (a *fakeAgent) broadcastLocked() {
 	a.version++
-	for queue := range a.subs {
-		queue <- a.snapshotLocked()
+	for sub := range a.subs {
+		sub.queue <- a.snapshotLocked()
 	}
 }
 
@@ -189,6 +206,49 @@ func (a *fakeAgent) setRPCError(err error) {
 	defer a.mu.Unlock()
 
 	a.rpcErr = err
+}
+
+// breakWatches ends every open stream with err, which is how a running
+// driver's watch sees the agent go away: an Unavailable is the agent dying or
+// restarting and the client reconnects through it, while anything else is a
+// failure reconnecting cannot fix.
+//
+// Streams opened afterwards are served normally unless setRPCError says
+// otherwise, so a test can model an agent that comes back.
+func (a *fakeAgent) breakWatches(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.breakWatchesLocked(err)
+}
+
+// restartWith models the agent process restarting onto a different topology:
+// every open stream is dropped with the Unavailable a dying gRPC server sends
+// its clients, and the agent answers the next watch with topology.
+//
+// The new topology is deliberately not broadcast to the streams being
+// dropped, so the only way a driver can learn about it is the initial
+// snapshot of a stream it re-established itself. That makes an assertion on
+// the published devices an assertion about the reconnect.
+func (a *fakeAgent) restartWith(topology *topologypb.HostPhysicalTopology) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.topology = topology
+	// A restarted agent counts from zero again, which the client is expected
+	// to tolerate because versions only order states within one stream.
+	a.version = 0
+	a.breakWatchesLocked(status.Error(codes.Unavailable, "fabric manager agent restarting"))
+}
+
+func (a *fakeAgent) breakWatchesLocked(err error) {
+	for sub := range a.subs {
+		select {
+		case sub.fail <- err:
+		default:
+			// Already breaking; the first error is the one that ends it.
+		}
+	}
 }
 
 // watchCount reports how many WatchTopology streams the agent has been asked

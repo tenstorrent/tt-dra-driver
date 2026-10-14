@@ -402,6 +402,41 @@ func (h *harness) fatalErrors() []error {
 	return append([]error(nil), h.fatal...)
 }
 
+// waitForFatal blocks until the driver reports a non-recoverable background
+// error and returns it, taking it off the list the cleanup checks.
+//
+// In production that error cancels the main context and the process exits, so
+// a scenario that waits for one is asserting the driver asked to be restarted
+// rather than carrying on in a state it cannot recover from.
+func (h *harness) waitForFatal() error {
+	h.t.Helper()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if err := h.takeFatal(); err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatal("the driver never reported a non-recoverable background error")
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// takeFatal removes and returns the oldest recorded non-recoverable error, or
+// nil when none has been reported.
+func (h *harness) takeFatal() error {
+	h.fatalMu.Lock()
+	defer h.fatalMu.Unlock()
+
+	if len(h.fatal) == 0 {
+		return nil
+	}
+	err := h.fatal[0]
+	h.fatal = h.fatal[1:]
+	return err
+}
+
 // allocate creates an allocated ResourceClaim in the API, as the scheduler
 // would once it picked devices on this node. The kubelet passes only a claim
 // reference over the DRA socket and the plugin fetches the claim itself, so the
