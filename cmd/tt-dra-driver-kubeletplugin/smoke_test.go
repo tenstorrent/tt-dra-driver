@@ -624,6 +624,53 @@ func TestSmokeRollingUpdateUsesPodScopedSockets(t *testing.T) {
 	h.mustPrepare(claim)
 }
 
+// opaqueParameters is a configuration body of the shape a profile with a
+// config schema would accept. The Tenstorrent profile has none, so the
+// contents matter only in that they are well-formed.
+const opaqueParameters = `{"apiVersion":"tenstorrent.com/v1alpha1","kind":"ChipConfig"}`
+
+// TestSmokeRejectsAClaimCarryingAnOpaqueConfig covers the answer to a
+// configuration the driver cannot honour. The Tenstorrent profile defines no
+// opaque config schema yet, so a claim that carries one is asking for
+// behaviour the driver does not implement: failing the claim puts that on the
+// pod, where silently ignoring the parameters would hand the workload a
+// device set up differently from what it asked for.
+func TestSmokeRejectsAClaimCarryingAnOpaqueConfig(t *testing.T) {
+	h := startHarness(t, withTopology(n150Topology()))
+
+	claim := h.allocateWithConfig("claim-uid", testDriverName, opaqueParameters, "tt-0")
+	result, ok := h.prepare(claim)[string(claim.UID)]
+	if !ok {
+		t.Fatalf("no result for claim %s", claim.UID)
+	}
+	if result.GetError() == "" {
+		t.Fatal("prepare accepted an opaque configuration the profile does not support")
+	}
+	// The message is the decoder's rather than the profile's "not supported
+	// yet": the profile contributes an empty scheme, so the parameters fail
+	// to decode before Validate or ApplyConfig ever see them. Pinned as what
+	// a user gets today.
+	if !strings.Contains(result.GetError(), "config") {
+		t.Errorf("the error does not mention the configuration: %s", result.GetError())
+	}
+	assertNotExists(t, h.claimSpecPath("claim-uid"))
+}
+
+// TestSmokeIgnoresAnotherDriversOpaqueConfig is the other half of that: a
+// claim can span several drivers, each with its own parameters, and this
+// driver must step over the ones not addressed to it instead of failing a
+// claim it can satisfy.
+func TestSmokeIgnoresAnotherDriversOpaqueConfig(t *testing.T) {
+	h := startHarness(t, withTopology(n150Topology()))
+
+	claim := h.allocateWithConfig("claim-uid", "other.example.com", opaqueParameters, "tt-0")
+	prepared := h.mustPrepare(claim)
+	if len(prepared) != 1 {
+		t.Fatalf("prepared %d devices, want 1", len(prepared))
+	}
+	assertExists(t, h.claimSpecPath("claim-uid"))
+}
+
 // TestSmokeUnprepareIsIdempotent checks what the kubelet does on retry: an
 // unprepare it already completed, and one for a claim this driver instance
 // never prepared, must both be no-ops rather than errors.
