@@ -193,16 +193,14 @@ func TestSmokePublishesDocumentedAttributes(t *testing.T) {
 			devices := h.waitForPublishedDevices(test.wantDevices...)
 			device := devices[test.wantDevices[0]]
 
-			// Documented as the constant "tenstorrent.com" in
-			// docs/single-host.md, but the profile publishes "tenstorrent".
-			// Pinned to what the driver actually emits; the documentation and
-			// the code need reconciling either way.
+			// The attribute value, not the domain the attributes live under:
+			// a selector reads device.attributes["tenstorrent.com"].vendor
+			// and gets "tenstorrent" back.
 			if got := attrString(t, device, "vendor"); got != "tenstorrent" {
 				t.Errorf("vendor is %q, want tenstorrent", got)
 			}
-			// Passed through from the agent verbatim. docs/single-host.md
-			// describes this as "wormhole" and shows a selector matching that,
-			// which would not match the "wormhole_b0" the proto documents.
+			// Passed through from the agent verbatim, so the value is the
+			// agent's spelling -- "wormhole_b0", not "wormhole".
 			if got := attrString(t, device, "chipArch"); got != test.wantArch {
 				t.Errorf("chipArch is %q, want %q", got, test.wantArch)
 			}
