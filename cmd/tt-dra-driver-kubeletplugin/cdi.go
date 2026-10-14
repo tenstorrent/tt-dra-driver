@@ -51,15 +51,17 @@ type CDIHandler struct {
 	root        string
 	driverName  string
 	class       string
+	nodeName    string
 	commonEdits *cdiapi.ContainerEdits
 }
 
 // NewCDIHandler returns a CDIHandler that writes its specs into the given
-// root directory. The optional commonEdits, when non-nil, are merged into
-// the per-driver "common" CDI device that the kubelet plugin prepends to
+// root directory. nodeName is injected into every container as
+// KUBERNETES_NODE_NAME. The optional commonEdits, when non-nil, are merged
+// into the per-driver "common" CDI device that the kubelet plugin prepends to
 // every claim; a typical use is to declare node-wide bind mounts (e.g.
 // hugepages) that every workload using a managed device requires.
-func NewCDIHandler(root, driverName, class string, commonEdits *cdiapi.ContainerEdits) (*CDIHandler, error) {
+func NewCDIHandler(root, driverName, class, nodeName string, commonEdits *cdiapi.ContainerEdits) (*CDIHandler, error) {
 	cache, err := cdiapi.NewCache(
 		cdiapi.WithSpecDirs(root),
 	)
@@ -71,6 +73,7 @@ func NewCDIHandler(root, driverName, class string, commonEdits *cdiapi.Container
 		root:        root,
 		driverName:  driverName,
 		class:       class,
+		nodeName:    nodeName,
 		commonEdits: commonEdits,
 	}, nil
 }
@@ -82,7 +85,7 @@ func (cdi *CDIHandler) CreateCommonSpecFile() error {
 	commonEdits := cdiapi.ContainerEdits{
 		ContainerEdits: &cdispec.ContainerEdits{
 			Env: []string{
-				fmt.Sprintf("KUBERNETES_NODE_NAME=%s", os.Getenv("NODE_NAME")),
+				fmt.Sprintf("KUBERNETES_NODE_NAME=%s", cdi.nodeName),
 				fmt.Sprintf("DRA_RESOURCE_DRIVER_NAME=%s", cdi.driverName),
 			},
 		},
