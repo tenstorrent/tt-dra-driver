@@ -130,8 +130,24 @@ vet:
 TESTFLAGS ?=
 
 COVERAGE_FILE := coverage.out
+
+# Which packages coverage is measured over, as opposed to which packages are
+# tested (that is always all of them).
+#
+# Without -coverpkg each package is credited only for what its own tests
+# execute, which badly understates this module: the end-to-end suite lives in
+# the kubelet plugin package and drives the fabric manager client and the
+# Tenstorrent profile through a real gRPC connection, and none of that counted.
+# Measuring across the module credits code to whichever test reaches it.
+#
+# The generated protobuf packages are excluded. They are thousands of
+# statements of code nobody in this repo wrote or should be testing directly,
+# and leaving them in would swamp the total with a number that says nothing
+# about the driver.
+COVERPKGS = $(shell go list $(MODULE)/... | grep -v '/proto/' | paste -sd, -)
+
 test: build cmds
-	go test $(TESTFLAGS) -v -coverprofile=$(COVERAGE_FILE) $(MODULE)/...
+	go test $(TESTFLAGS) -v -coverpkg=$(COVERPKGS) -coverprofile=$(COVERAGE_FILE) $(MODULE)/...
 
 coverage: test
 	go tool cover -func=$(COVERAGE_FILE)
