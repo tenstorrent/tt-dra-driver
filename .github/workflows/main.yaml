@@ -18,13 +18,13 @@ jobs:
       version: ${{ steps.semver.outputs.version }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           filter: blob:none
       - name: Determine version
         id: semver
-        uses: paulhatch/semantic-version@v5.4.0
+        uses: paulhatch/semantic-version@v6.0.4
         with:
           tag_prefix: ""
           version_format: "${major}.${minor}.${patch}"
