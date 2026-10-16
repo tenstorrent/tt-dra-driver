@@ -31,10 +31,10 @@ cannot always distinguish a single-board card from a same-arch Galaxy.
 
 | Board                        | `boardName` | `chipArch`  | Bundles per host  | `chipCount` per bundle | Notes                                                                          |
 | ---------------------------- | ----------- | ----------- | ----------------- | ---------------------- | ------------------------------------------------------------------------------ |
-| **n150**                     | `n150`      | `wormhole`  | 1                 | `1`                    | Single Wormhole ASIC, one MMIO endpoint.                                       |
-| **n300**                     | `n300`      | `wormhole`  | 1                 | `2`                    | MMIO ASIC + one bundled remote sibling on the same tray.                       |
+| **n150**                     | `n150`      | `wormhole_b0` | 1               | `1`                    | Single Wormhole ASIC, one MMIO endpoint.                                       |
+| **n300**                     | `n300`      | `wormhole_b0` | 1               | `2`                    | MMIO ASIC + one bundled remote sibling on the same tray.                       |
 | **p150**                     | `p150`      | `blackhole` | 1                 | `1`                    | Single Blackhole ASIC.                                                         |
-| **Wormhole Galaxy (6U UBB)** | `galaxy-wormhole`  | `wormhole`  | 32                | `1`                    | All 32 chips are PCIe-MMIO — each surfaces as its own bundle. Claim with `count: 32`. |
+| **Wormhole Galaxy (6U UBB)** | `galaxy-wormhole`  | `wormhole_b0` | 32         | `1`                    | All 32 chips are PCIe-MMIO — each surfaces as its own bundle. Claim with `count: 32`. |
 | **Blackhole UBB**            | `galaxy-blackhole` | `blackhole` | N (per your board)| `1`                    | Same all-MMIO shape as WH Galaxy; verify per-board with `kubectl get resourceslice`. |
 
 ```{note}
@@ -60,8 +60,8 @@ Reference them in CEL selectors as `device.attributes["tenstorrent.com"].<name>`
 
 | Attribute         | Type   | When set     | Value                                                                                    |
 | ----------------- | ------ | ------------ | ---------------------------------------------------------------------------------------- |
-| `vendor`          | string | always       | Constant `"tenstorrent.com"`.                                                            |
-| `chipArch`        | string | always       | ASIC architecture. Currently `"wormhole"` or `"blackhole"`.                              |
+| `vendor`          | string | always       | Constant `"tenstorrent"`. Note this is the attribute *value*; the domain the attributes live under is `tenstorrent.com`, as in the selectors below. |
+| `chipArch`        | string | always       | ASIC architecture, passed through from Fabric Manager verbatim: `"wormhole_b0"` or `"blackhole"`. Match on `boardName` instead unless you specifically mean the architecture. |
 | `chipCount`       | int    | always       | Total ASICs a workload gets from this device: the MMIO parent plus bundled remote siblings on the same tray. Match on it to require an n300 (`== 2`) or a single-chip card (`== 1`). |
 | `chipID`          | int    | always       | Host-local chip ID of the MMIO parent. Stable across agent restarts on the same host.    |
 | `uniqueID`        | string | always       | Globally unique 64-bit ASIC ID of the MMIO parent, rendered as a decimal string.         |
@@ -385,7 +385,7 @@ Each of the three pods gets its own n150 on whatever host has one free.
 - Prefer `boardName == "n150"` (or `"n300"`, `"p150"`, ...) over selectors
   that mix `chipArch` and `chipCount`. In clusters that mix single-board
   cards with a Wormhole Galaxy, a standalone Galaxy MMIO bundle can present
-  as `chipArch == "wormhole"` with `chipCount == 1` — the same as an n150.
+  as `chipArch == "wormhole_b0"` with `chipCount == 1` — the same as an n150.
   Only `boardName` (or the raw numeric `boardType`) discriminates.
 
 **"Whole Galaxy" claim only bound one chip.**
