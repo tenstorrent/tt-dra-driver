@@ -371,6 +371,137 @@ func TestSmokeSurfacesAnUnexpectedAgentStatus(t *testing.T) {
 	}
 }
 
+// TestSmokeRepublishesWhenADeviceAppears covers the reason the driver watches
+// the fabric manager agent instead of querying it once: hardware that the
+// agent discovers after the driver came up has to reach the ResourceSlice
+// without anything restarting.
+func TestSmokeRepublishesWhenADeviceAppears(t *testing.T) {
+	h := startHarness(t, withTopology(n300Topology()))
+	h.waitForPublishedDevices("tt-0")
+
+	// A second board joins the host: the same n300 on tray 1, plus an n150 on
+	// tray 2.
+	h.agent.setTopology(twoBoardTopology())
+	h.waitForPublishedDevices("tt-0", "tt-2")
+
+	// Publishing is only half the job. The new device also has to be
+	// allocatable, or the first pod the scheduler places on it fails to start
+	// with a device the driver advertises but will not prepare.
+	claim := h.allocate("claim-uid", "tt-2")
+	prepared := h.mustPrepare(claim)
+	if len(prepared) != 1 {
+		t.Fatalf("prepared %d devices, want 1", len(prepared))
+	}
+	wantCDI := []string{
+		"k8s.tenstorrent.com/tenstorrent=common",
+		"k8s.tenstorrent.com/tenstorrent=claim-uid-tt-2",
+	}
+	if got := prepared[0].GetCdiDeviceIds(); !slices.Equal(got, wantCDI) {
+		t.Errorf("CDI device IDs are %v, want %v", got, wantCDI)
+	}
+	// The spec has to name the new board's character device, which is the
+	// detail a republish that forgot to refresh the profile's mapping would
+	// get wrong.
+	spec := readFile(t, h.claimSpecPath("claim-uid"))
+	if want := "/dev/tenstorrent/" + strconv.Itoa(2+deviceNodeIDOffset); !strings.Contains(spec, want) {
+		t.Errorf("the claim spec does not contain %q:\n%s", want, spec)
+	}
+}
+
+// TestSmokeRepublishesWhenADeviceDisappears is the other direction: a board
+// that stops being reported must leave the ResourceSlice, and must stop being
+// preparable, without disturbing the devices beside it or the claims already
+// holding it.
+func TestSmokeRepublishesWhenADeviceDisappears(t *testing.T) {
+	h := startHarness(t, withTopology(twoBoardTopology()))
+	h.waitForPublishedDevices("tt-0", "tt-2")
+
+	inFlight := h.allocate("claim-in-flight", "tt-2")
+	h.mustPrepare(inFlight)
+
+	// The n150 on tray 2 stops being reported, leaving the n300 behind.
+	h.agent.setTopology(n300Topology())
+	h.waitForPublishedDevices("tt-0")
+
+	// A claim the scheduler allocated against the device just before it went
+	// away has to fail by name, rather than hand the kubelet a CDI device
+	// resolving to a node that is no longer there.
+	late := h.allocate("claim-late", "tt-2")
+	result, ok := h.prepare(late)[string(late.UID)]
+	if !ok {
+		t.Fatalf("no result for claim %s", late.UID)
+	}
+	if result.GetError() == "" {
+		t.Fatal("prepare succeeded for a device that is no longer allocatable")
+	}
+	if !strings.Contains(result.GetError(), "tt-2") {
+		t.Errorf("the error does not name the missing device: %s", result.GetError())
+	}
+
+	// The claim prepared while the device was still there must still be
+	// releasable, or the kubelet cannot finish tearing its pod down.
+	h.unprepare(inFlight)
+	assertNotExists(t, h.claimSpecPath("claim-in-flight"))
+
+	// The surviving board is unaffected throughout.
+	surviving := h.allocate("claim-survivor", "tt-0")
+	h.mustPrepare(surviving)
+}
+
+// TestSmokeRecoversWhenTheAgentRestarts covers the agent going down under a
+// running driver. The watch reconnects on its own, and because every stream
+// opens with a full snapshot, the reconnect is also how the driver picks up
+// whatever changed while it was disconnected.
+func TestSmokeRecoversWhenTheAgentRestarts(t *testing.T) {
+	h := startHarness(t, withTopology(n300Topology()))
+	h.waitForPublishedDevices("tt-0")
+
+	// The agent drops every stream and comes back reporting a second board.
+	// It does not announce the change to the streams it is dropping, so the
+	// only route the n150 has to the ResourceSlice is a stream the driver
+	// re-established itself.
+	h.agent.restartWith(twoBoardTopology())
+
+	h.waitForPublishedDevices("tt-0", "tt-2")
+	if got := h.agent.watchCount(); got < 2 {
+		t.Errorf("the agent served %d watches, want a reconnect after the restart", got)
+	}
+
+	// Devices stay preparable across the reconnect; an unnoticed stale client
+	// would show up here rather than in the slice.
+	claim := h.allocate("claim-uid", "tt-2")
+	h.mustPrepare(claim)
+
+	// The harness cleanup fails the test if the driver reported a
+	// non-recoverable error, which is the assertion that a restarting agent
+	// did not take the driver down with it.
+}
+
+// TestSmokeFailsWhenTheTopologyWatchStopsForGood covers the failure the watch
+// cannot ride out. A driver that has lost its watch would keep serving the
+// last topology it saw and silently stop tracking the hardware, so it asks to
+// be restarted instead -- in production by cancelling the main context, which
+// exits the process and lets the kubelet start a replacement with a fresh
+// watch.
+func TestSmokeFailsWhenTheTopologyWatchStopsForGood(t *testing.T) {
+	h := startHarness(t, withTopology(n150Topology()))
+	h.waitForPublishedDevices("tt-0")
+
+	// Internal is not a condition reconnecting can fix, unlike the
+	// Unavailable of an agent that is merely restarting.
+	h.agent.breakWatches(status.Error(codes.Internal, "agent lost its topology"))
+
+	err := h.waitForFatal()
+	if !strings.Contains(err.Error(), "agent lost its topology") {
+		t.Errorf("the fatal error does not carry the agent's reason: %v", err)
+	}
+	// No reconnect was attempted: the driver served exactly the one watch it
+	// opened at startup.
+	if got := h.agent.watchCount(); got != 1 {
+		t.Errorf("the agent served %d watches, want exactly 1 with no reconnects", got)
+	}
+}
+
 // TestSmokeLivenessProbeReportsServing exercises the probe the Helm chart wires
 // up as the container's livenessProbe. It answers SERVING only once both the
 // registration and the DRA socket respond, which makes it a single assertion
