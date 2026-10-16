@@ -42,11 +42,11 @@ jobs:
     # socket wait fails the run instead of occupying a runner for hours.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # From go.mod, so the toolchain cannot drift from what the module
       # targets. Matches check.yaml.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
