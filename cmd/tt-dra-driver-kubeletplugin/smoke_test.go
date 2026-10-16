@@ -113,6 +113,13 @@ func TestSmokeRegistersAndPreparesAnN300(t *testing.T) {
 			t.Errorf("the common spec does not mount %q:\n%s", want, common)
 		}
 	}
+	// The node name reaches the container from the driver's own
+	// configuration. The harness sets only the flag, as `--node-name` on a
+	// command line would, so this also pins that the environment variable is
+	// not the sole source.
+	if want := "KUBERNETES_NODE_NAME=" + testNodeName; !strings.Contains(common, want) {
+		t.Errorf("the common spec does not set %q:\n%s", want, common)
+	}
 
 	h.unprepare(claim)
 	assertNotExists(t, h.claimSpecPath("claim-uid"))
