@@ -312,10 +312,10 @@ func testTopology() *topologypb.HostPhysicalTopology {
 	}
 }
 
-// publish drives one usable snapshot of testTopology() through the profile
-// and returns both the profile (so ApplyConfig can be exercised against the
-// mapping it recorded) and the resources it published.
-func publish(t *testing.T, opts Options) (*Profile, resourceslice.DriverResources) {
+// publishFrom drives one usable snapshot of the given topology through the
+// profile and returns both the profile (so ApplyConfig can be exercised
+// against the mapping it recorded) and the resources it published.
+func publishFrom(t *testing.T, opts Options, topo *topologypb.HostPhysicalTopology) (*Profile, resourceslice.DriverResources) {
 	t.Helper()
 	_, ctx := ktesting.NewTestContext(t)
 	ctx, cancel := context.WithCancel(ctx)
@@ -327,15 +327,35 @@ func publish(t *testing.T, opts Options) (*Profile, resourceslice.DriverResource
 
 	sendSnapshot(t, topology, fabricmanager.Snapshot{
 		Status:   agentpb.GetTopologyStatus_TOPOLOGY_OK,
-		Topology: testTopology(),
+		Topology: topo,
 	})
 	return profile, recvResources(t, watch)
+}
+
+func publish(t *testing.T, opts Options) (*Profile, resourceslice.DriverResources) {
+	t.Helper()
+	return publishFrom(t, opts, testTopology())
 }
 
 func enumerate(t *testing.T, opts Options) resourceslice.DriverResources {
 	t.Helper()
 	_, resources := publish(t, opts)
 	return resources
+}
+
+// trayOfMmioChips builds a topology of consecutively numbered MMIO chips
+// spread over trays of the given sizes, which is how the counter-packing
+// tests reach host shapes no real board has.
+func traysOfMmioChips(sizes ...int) *topologypb.HostPhysicalTopology {
+	topo := &topologypb.HostPhysicalTopology{}
+	chipID := uint32(0)
+	for tray, size := range sizes {
+		for i := 0; i < size; i++ {
+			topo.Asics = append(topo.Asics, asic(chipID, uint32(tray), uint32(i), 7, true))
+			chipID++
+		}
+	}
+	return topo
 }
 
 // devicesByName flattens every device of every slice in the node's pool.
@@ -361,6 +381,15 @@ func counterSetsByName(resources resourceslice.DriverResources) map[string]resou
 		}
 	}
 	return counterSets
+}
+
+func sortedCounterSetNames(sets map[string]resourceapi.CounterSet) []string {
+	names := make([]string, 0, len(sets))
+	for name := range sets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func sortedDeviceNames(devices map[string]resourceapi.Device) []string {
@@ -453,23 +482,30 @@ func capacityValue(capacity resourceapi.DeviceCapacity) int64 {
 	return value.Value()
 }
 
-// TestTrayCounters pins down the counter arithmetic that makes chips and
-// trays mutually exclusive: one counter per tray, sized to the tray's chip
-// devices, one unit consumed per chip and all of them by the tray.
-func TestTrayCounters(t *testing.T) {
+// TestChipCounters pins down the counter arithmetic that makes chips and
+// the composites covering them mutually exclusive: one counter per chip
+// device, worth one unit, consumed by the chip itself and by every
+// composite that covers it.
+//
+// Counting per chip rather than per tray is what will let a composite
+// cover part of a tray; a tray-sized counter can only say how many of its
+// chips are held, not which.
+func TestChipCounters(t *testing.T) {
 	resources := enumerate(t, Options{TrayDevices: true})
 	devices := devicesByName(t, resources)
 
 	counterSets := counterSetsByName(resources)
-	set, ok := counterSets["tt-trays-0"]
+	set, ok := counterSets["tt-chips-0"]
 	if !ok {
-		t.Fatalf("counter sets = %v, want one named tt-trays-0", counterSets)
+		t.Fatalf("counter sets = %v, want one named tt-chips-0", counterSets)
 	}
-	if got := quantityValue(set.Counters["tray-0"]); got != 1 {
-		t.Errorf("counter tray-0 = %d, want 1 (one chip device on tray 0)", got)
+	for _, name := range []string{"chip-0", "chip-2", "chip-3"} {
+		if got := quantityValue(set.Counters[name]); got != 1 {
+			t.Errorf("counter %s = %d, want 1", name, got)
+		}
 	}
-	if got := quantityValue(set.Counters["tray-1"]); got != 2 {
-		t.Errorf("counter tray-1 = %d, want 2 (two chip devices on tray 1)", got)
+	if got := len(set.Counters); got != 3 {
+		t.Errorf("counter set holds %d counters, want one per chip device (3)", got)
 	}
 
 	// A slice may carry devices or shared counters, never both.
@@ -483,8 +519,8 @@ func TestTrayCounters(t *testing.T) {
 		t.Helper()
 		got := make(map[string]int64)
 		for _, dcc := range devices[name].ConsumesCounters {
-			if dcc.CounterSet != "tt-trays-0" {
-				t.Errorf("device %q consumes from counter set %q, want tt-trays-0", name, dcc.CounterSet)
+			if dcc.CounterSet != "tt-chips-0" {
+				t.Errorf("device %q consumes from counter set %q, want tt-chips-0", name, dcc.CounterSet)
 			}
 			for counter, value := range dcc.Counters {
 				got[counter] = quantityValue(value)
@@ -494,11 +530,11 @@ func TestTrayCounters(t *testing.T) {
 	}
 
 	for name, want := range map[string]map[string]int64{
-		"tt-0":      {"tray-0": 1},
-		"tt-2":      {"tray-1": 1},
-		"tt-3":      {"tray-1": 1},
-		"tt-tray-0": {"tray-0": 1},
-		"tt-tray-1": {"tray-1": 2},
+		"tt-0":      {"chip-0": 1},
+		"tt-2":      {"chip-2": 1},
+		"tt-3":      {"chip-3": 1},
+		"tt-tray-0": {"chip-0": 1},
+		"tt-tray-1": {"chip-2": 1, "chip-3": 1},
 	} {
 		got := consumption(name)
 		if len(got) != len(want) {
@@ -512,6 +548,123 @@ func TestTrayCounters(t *testing.T) {
 			}
 		}
 	}
+}
+
+// consumptionSets returns the counter sets a device draws from, in
+// declaration order.
+func consumptionSets(device resourceapi.Device) []string {
+	var sets []string
+	for _, dcc := range device.ConsumesCounters {
+		sets = append(sets, dcc.CounterSet)
+	}
+	return sets
+}
+
+// TestCounterPackingKeepsTraysTogether checks that counters are packed a
+// whole tray at a time. A device may draw from at most two counter sets,
+// so a tray split across sets for no reason would spend a budget that
+// cross-tray composites are going to need.
+func TestCounterPackingKeepsTraysTogether(t *testing.T) {
+	// Two trays of 20 chips: the second does not fit alongside the first
+	// in a 32-counter set, so it must start a set of its own rather than
+	// straddle the boundary.
+	_, resources := publishFrom(t, Options{TrayDevices: true}, traysOfMmioChips(20, 20))
+	devices := devicesByName(t, resources)
+
+	counterSets := counterSetsByName(resources)
+	if len(counterSets) != 2 {
+		t.Fatalf("counter sets = %v, want two", sortedCounterSetNames(counterSets))
+	}
+	for name, set := range counterSets {
+		if len(set.Counters) != 20 {
+			t.Errorf("counter set %q holds %d counters, want 20 (one tray's chips)", name, len(set.Counters))
+		}
+	}
+
+	for _, name := range []string{"tt-tray-0", "tt-tray-1"} {
+		if got := consumptionSets(devices[name]); len(got) != 1 {
+			t.Errorf("tray device %q draws from counter sets %v, want exactly one", name, got)
+		}
+	}
+}
+
+// TestCounterPackingSplitsOversizedTray covers the tray that cannot fit in
+// one counter set: it spills into a second, and the tray device is still
+// publishable because two is the per-device limit.
+func TestCounterPackingSplitsOversizedTray(t *testing.T) {
+	_, resources := publishFrom(t, Options{TrayDevices: true}, traysOfMmioChips(40))
+	devices := devicesByName(t, resources)
+
+	tray, ok := devices["tt-tray-0"]
+	if !ok {
+		t.Fatalf("published devices = %v, want the tray device among them", sortedDeviceNames(devices))
+	}
+	if got := consumptionSets(tray); len(got) != 2 {
+		t.Errorf("tray device draws from counter sets %v, want two (32 counters per set)", got)
+	}
+
+	counted := 0
+	for _, dcc := range tray.ConsumesCounters {
+		counted += len(dcc.Counters)
+	}
+	if counted != 40 {
+		t.Errorf("tray device consumes %d counters, want one per chip device (40)", counted)
+	}
+}
+
+// TestCounterPackingDropsUnrepresentableTray is the safety property behind
+// the per-device counter-set limit: a tray whose chips span three sets
+// cannot declare its exclusion, and publishing it anyway would advertise a
+// tray the scheduler believes is free while its chips are in use. It must
+// be dropped, leaving the chip devices alone.
+func TestCounterPackingDropsUnrepresentableTray(t *testing.T) {
+	_, resources := publishFrom(t, Options{TrayDevices: true}, traysOfMmioChips(65))
+	devices := devicesByName(t, resources)
+
+	if _, ok := devices["tt-tray-0"]; ok {
+		t.Error("tray device published despite spanning more counter sets than one device may consume from")
+	}
+	if got := len(devices); got != 65 {
+		t.Errorf("published %d devices, want the 65 chip devices and no tray", got)
+	}
+	for name, device := range devices {
+		if got := len(device.ConsumesCounters); got != 1 {
+			t.Errorf("chip device %q draws from %d counter sets, want exactly its own", name, got)
+		}
+	}
+}
+
+// TestCounterConsumptionNamesExactChips is the property the per-chip
+// counters exist for: a composite covering part of a tray says precisely
+// which chips it holds. The tray-sized counter it replaced could only say
+// how many, which would have let the same chips be handed out twice.
+func TestCounterConsumptionNamesExactChips(t *testing.T) {
+	trays := groupBundlesByTray(bundleHostASICs(traysOfMmioChips(8).GetAsics(), ktesting.NewLogger(t, ktesting.NewConfig())))
+	layout := buildChipCounterSets(trays)
+
+	// A quadrant of the tray, the shape a mesh device will cover.
+	consumption, ok := chipCounterConsumption(layout, trays[0].bundles[2:6])
+	if !ok {
+		t.Fatal("chipCounterConsumption refused a four-chip subset of one tray")
+	}
+	if len(consumption) != 1 {
+		t.Fatalf("subset draws from %d counter sets, want one", len(consumption))
+	}
+
+	got := sortedCounterNames(consumption[0].Counters)
+	want := []string{"chip-2", "chip-3", "chip-4", "chip-5"}
+	if !slices.Equal(got, want) {
+		t.Errorf("subset consumes %v, want exactly %v", got, want)
+	}
+}
+
+func sortedCounterNames(counters map[string]resourceapi.Counter) []string {
+	names := make([]string, 0, len(counters))
+	for name := range counters {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // TestWithoutTrayDevices asserts the opt-out keeps the published slice
