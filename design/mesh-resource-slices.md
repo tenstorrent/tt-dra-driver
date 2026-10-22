@@ -1,6 +1,6 @@
 # Publishing PGD meshes as DRA devices
 
-Status: phase 1 is implemented. Phases 2 and 3 are proposals.
+Status: phases 1 and 2 are implemented. Phase 3 is a proposal.
 
 ## Problem
 
@@ -126,42 +126,71 @@ allocator tests pass unchanged. The one new behaviour is the dropped tray —
 a tray whose chips span three sets, which takes more than 64 chip devices on
 one tray to reach.
 
-## Phase 2 — hardcoded `4x2_Mesh_horizontal`
+## Phase 2 — hardcoded `4x2_Mesh_horizontal` (done)
 
-Publish the four meshes from the table above, gated on
-`quirks.is_bh_glx_rev_c`, a `galaxy-blackhole` board type, and all four trays
-being present. Anything else publishes no mesh devices at all.
+The four meshes from the table above are published as `mesh` devices, gated
+on `quirks.is_bh_glx_rev_c`. Everything lives in
+`internal/profiles/tenstorrent/mesh.go`.
 
 **Device model.** A third `unit` attribute value, `mesh`, alongside `chip`
-and `tray`. A `mesh.<driverName>` DeviceClass in the chart with
-`extendedResourceName: tenstorrent.com/mesh`, selecting on `unit == 'mesh'`
-the way the tray class already does. A `--enable-mesh-devices` flag
-(`kubeletPlugin.meshDevices` in the chart) on by default, since the rev-C
-gate already keeps it off everywhere it does not apply.
-
-**Attributes.** `meshName: "4x2_Mesh_horizontal"`, `meshShape: "4x2"`,
-`chipCount: 8`, `trayIDs: "1,2"`, and ordered `chipIDs` / `uniqueIDs` CSVs in
-mesh order. Capacity carries the summed memory. The per-device attribute cap
-is why the chip list is a string rather than structured. Name the device from
-the lowest covered chip id so it is stable across topology churn.
-
-`ApplyConfig` needs no new machinery: an `allocatableUnit` already holds an
+and `tray`, with a `mesh.<driverName>` DeviceClass in the chart
+(`extendedResourceName: tenstorrent.com/mesh`) selecting on it. An
+`--enable-mesh-devices` flag (`kubeletPlugin.meshDevices`) on by default,
+since the rev-C gate already keeps it inert everywhere it does not apply.
+`ApplyConfig` needed no new machinery: an `allocatableUnit` already holds an
 ordered bundle list and emits one `/dev/tenstorrent/N` per MMIO chip.
 
-**Runtime validation.** Before publishing a mesh, confirm its eight chips are
-wired as the declared 4x2 in `local_connections`. If they are not, log
-loudly and skip that mesh. This keeps a mis-cabled or rev-B host from
-receiving a device that claims a topology it does not have, and it is the
-first piece of the phase 3 resolver.
+**Attributes.** `meshName`, `meshShape`, `meshRows`, `meshCols`, `chipIDs`
+(ordered, the mesh coordinate order), `trayIDs`, `uniqueID` of the origin
+chip, board identity, `chipCount`, `chipDeviceCount`, and summed `memory`
+capacity. The ordered `uniqueIDs` list the plan called for does not exist:
+`DeviceAttributeMaxValueLength` is 64 bytes and eight 20-digit ids do not
+fit. `chipIDs` plus the origin `uniqueID` carry the same information in the
+space available.
 
-**Tests.** A 32-ASIC rev-C fake topology driven through the existing
-allocator harness: four meshes published with the right chip sets *and*
-order; exclusion proven in both directions against chips and against trays;
-two disjoint meshes co-allocatable; nothing published when the quirk flag is
-absent.
+That cap turned out to matter beyond meshes. The `remoteUniqueIDs` attribute
+on chip devices was already built by joining ids with no length guard, and a
+bundle with four or more remotes would have produced a value the apiserver
+rejects — taking the entire slice, and so every device on the node, with it.
+Both lists now go through one helper that elides rather than overflows.
 
-**Docs.** A section and claim recipe in `docs/single-host.md`, and a fix for
-the "one tray of 32 chips" statement once assumption 1 is settled.
+**Gating.** Three independent conditions, each of which drops a mesh rather
+than guessing: every slot must land on a separately allocatable chip (so
+hardware where mesh members are bundled into an MMIO parent publishes
+nothing instead of something wrong); every member must be a
+`galaxy-blackhole` board, checked per mesh so a mixed host still publishes
+what it can; and the chips the grouping places side by side must be
+*connected to each other* in `local_connections`. A host reporting no link
+graph at all — the sysfs discovery fallback — publishes no meshes, since
+nothing confirms the layout.
+
+Assumption 2 (`asic_location` base) was removed rather than resolved: the
+index takes the lowest location the agent reports as the base and shifts the
+descriptor's 1-based locations onto it, so either convention works and the
+tests cover both.
+
+**Tests.** `mesh_test.go` builds a 32-ASIC rev-C host from the descriptor's
+*tray and host* groupings — the four tray orientations placed on the 2x2 the
+`galaxy_hosts` grouping describes — producing one 4x8 grid, and links each
+chip to its orthogonal neighbours. The expected meshes are then the grid's
+four column-pairs, a conclusion the production code never sees: it works
+from quadrants of named trays. Mutating the pairing in `bhGalaxyRevCMeshes`
+makes the adjacency check reject the mesh and the tests fail, so the oracle
+is independent rather than a restatement.
+
+On top of that: both location bases, the quirk gate, the missing link graph,
+a single cut link dropping exactly one mesh, a non-MMIO member dropping the
+meshes covering it, `ApplyConfig` handing over all eight device nodes, and
+an allocator pass covering mesh/chip, mesh/tray and mesh/mesh exclusion in
+both directions.
+
+### Still to confirm on hardware
+
+The gating means a wrong assumption now costs a logged skip rather than a
+bad device, but the four assumptions above are still assumptions. In
+particular, if the agent reports a Galaxy as one tray of 32 rather than four
+trays of 8 (assumption 1), *no* mesh resolves and the logs will say which
+slot was missing.
 
 ## Phase 3 — PGDs as configuration
 

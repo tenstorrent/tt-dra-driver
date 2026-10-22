@@ -91,35 +91,40 @@ func sharedCountersSupported(ctx context.Context, client coreclientset.Interface
 	return supported, nil
 }
 
-// resolveTrayDevices decides whether this driver instance publishes
-// whole-tray devices. Trays are opt-out via --enable-tray-devices, but
-// even when asked for they are only safe on a cluster that keeps shared
-// counters, so the answer is confirmed against the apiserver first.
+// resolveCompositeDevices decides whether this driver instance publishes
+// the composite devices — whole trays and known meshes — that cover more
+// than one chip. Both are opt-out via their own flag, but even when asked
+// for they are only safe on a cluster that keeps shared counters, since
+// that is what holds them exclusive with the chips they cover. The answer
+// is confirmed against the apiserver once, for both.
 //
 // A cluster that cannot keep counters — or a probe that fails to give a
 // clear answer — downgrades to chips only rather than failing startup:
 // chip allocation keeps working, which is both the safe and the less
 // disruptive outcome. The reason is logged as an error so the operator can
 // act on it.
-func resolveTrayDevices(ctx context.Context, client coreclientset.Interface, flags *Flags) bool {
+func resolveCompositeDevices(ctx context.Context, client coreclientset.Interface, flags *Flags) (trays, meshes bool) {
 	logger := klog.FromContext(ctx)
-	if !flags.enableTrayDevices {
-		logger.Info("Whole-tray devices are disabled; publishing per-chip devices only")
-		return false
+	if !flags.enableTrayDevices && !flags.enableMeshDevices {
+		logger.Info("Whole-tray and mesh devices are disabled; publishing per-chip devices only")
+		return false, false
 	}
 
 	supported, err := sharedCountersSupported(ctx, client, flags.driverName, flags.nodeName)
 	switch {
 	case err != nil:
 		logger.Error(err, "Could not determine whether this cluster supports ResourceSlice shared counters; publishing per-chip devices only. "+
-			"Tray devices need the DRAPartitionableDevices feature gate to stay mutually exclusive with the chips they contain")
-		return false
+			"Tray and mesh devices need the DRAPartitionableDevices feature gate to stay mutually exclusive with the chips they contain")
+		return false, false
 	case !supported:
-		logger.Error(nil, "This cluster drops ResourceSlice shared counters, so a tray and its chips could be allocated at the same time; publishing per-chip devices only. "+
-			"Enable the DRAPartitionableDevices feature gate (default on since Kubernetes 1.36) on the apiserver and the scheduler, or set --enable-tray-devices=false to silence this")
-		return false
+		logger.Error(nil, "This cluster drops ResourceSlice shared counters, so a composite device and its chips could be allocated at the same time; publishing per-chip devices only. "+
+			"Enable the DRAPartitionableDevices feature gate (default on since Kubernetes 1.36) on the apiserver and the scheduler, or set --enable-tray-devices=false --enable-mesh-devices=false to silence this")
+		return false, false
 	}
 
-	logger.Info("Publishing whole-tray devices alongside per-chip devices")
-	return true
+	logger.Info("Publishing composite devices alongside per-chip devices",
+		"trayDevices", flags.enableTrayDevices,
+		"meshDevices", flags.enableMeshDevices,
+	)
+	return flags.enableTrayDevices, flags.enableMeshDevices
 }
