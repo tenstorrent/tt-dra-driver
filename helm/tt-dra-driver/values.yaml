@@ -57,6 +57,18 @@ kubeletPlugin:
   # publishes per-chip devices only, rather than advertising trays it
   # cannot keep exclusive.
   trayDevices: true
+  # meshDevices publishes one allocatable device per multi-chip mesh the
+  # host's platform is known to wire up — a set of chips in a specific
+  # rectangular topology, published in mesh coordinate order — and
+  # installs a `mesh.<driverName>` DeviceClass for claiming them. Only
+  # platforms the driver has groupings for publish anything; everywhere
+  # else this is a no-op beyond the empty DeviceClass.
+  #
+  # A mesh is mutually exclusive with the chips it covers, and with any
+  # tray or other mesh overlapping it, through the same shared counters
+  # trayDevices relies on — so it carries the same DRAPartitionableDevices
+  # requirement.
+  meshDevices: true
   priorityClassName: "system-node-critical"
   updateStrategy:
     type: RollingUpdate

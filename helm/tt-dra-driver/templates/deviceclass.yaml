@@ -9,10 +9,10 @@ metadata:
   name: {{ $driver }}
 spec:
   extendedResourceName: tenstorrent.com/chip
-  # The driver publishes two kinds of device into the same pool: one per
-  # chip and one per physical tray. The `unit` attribute tells them apart,
-  # so this class pins it to "chip" and a request for a chip can never
-  # bind a whole tray.
+  # The driver publishes several kinds of device into the same pool: one
+  # per chip, one per physical tray, and one per known multi-chip mesh.
+  # The `unit` attribute tells them apart, so this class pins it to "chip"
+  # and a request for a chip can never bind a tray or a mesh.
   #
   # The has() guard keeps this class matching devices published by driver
   # versions that predate the `unit` attribute (e.g. mid rolling update):
@@ -42,4 +42,27 @@ spec:
         device.driver == '{{ $driver }}' &&
         has(device.attributes['{{ $driver }}'].unit) &&
         device.attributes['{{ $driver }}'].unit == 'tray'
+{{- end }}
+{{- if .Values.kubeletPlugin.meshDevices }}
+---
+apiVersion: {{ include "tt-dra-driver.resourceApiVersion" . }}
+kind: DeviceClass
+metadata:
+  name: mesh.{{ $driver }}
+spec:
+  extendedResourceName: tenstorrent.com/mesh
+  # A mesh device covers a set of chips wired into a specific topology,
+  # published in mesh coordinate order. Like a tray it is kept exclusive
+  # with the chips it covers through shared counters, so a mesh claim and
+  # a chip claim never end up on the same silicon.
+  #
+  # Narrow a claim to one topology with a selector on `meshName` (the
+  # grouping's name, e.g. "4x2_Mesh_horizontal") or on the `meshRows` and
+  # `meshCols` attributes.
+  selectors:
+  - cel:
+      expression: >-
+        device.driver == '{{ $driver }}' &&
+        has(device.attributes['{{ $driver }}'].unit) &&
+        device.attributes['{{ $driver }}'].unit == 'mesh'
 {{- end }}

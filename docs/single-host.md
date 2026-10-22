@@ -17,9 +17,12 @@ them as a set (`count: 32`), or as one tray device (see
 [Claiming whole trays](#claiming-whole-trays)).
 
 Alongside those per-chip devices the driver publishes one device per
-physical **tray**, so a whole board can be claimed as a single unit. The two
-views describe the same silicon and are mutually exclusive — see
-[Claiming whole trays](#claiming-whole-trays).
+physical **tray**, so a whole board can be claimed as a single unit — see
+[Claiming whole trays](#claiming-whole-trays) — and, on platforms it has
+groupings for, one device per **mesh**: a set of chips in a specific
+topology, handed over in mesh coordinate order. See
+[Claiming a mesh](#claiming-a-mesh). All of these views describe the same
+silicon, so a chip can only ever be in use through one of them at a time.
 
 ```{note}
 Multi-host layouts — one host's share of a multi-host Galaxy, or a whole
@@ -120,7 +123,8 @@ The container gets every `/dev/tenstorrent/<N>` node on that tray at once.
 ### Chips and trays are mutually exclusive
 
 A tray device and the chip devices on it describe the same silicon, so only
-one view of a tray can be in use at a time:
+one view of a tray can be in use at a time. The same holds for any
+[mesh device](#claiming-a-mesh) covering those chips:
 
 - While a tray is allocated, none of its chips can be allocated.
 - While *any* chip on a tray is allocated, that tray cannot be allocated.
@@ -210,6 +214,80 @@ spec:
           deviceClassName: tray.tenstorrent.com
           count: 4
 ```
+
+## Claiming a mesh
+
+A mesh is a set of chips wired into a specific rectangular topology. Unlike a
+tray it is not a physical object — it is a shape the platform's cabling
+supports, and on a Galaxy the interesting shapes cut across trays. The driver
+publishes one device per mesh it knows the host wires up, in its own
+DeviceClass, `mesh.tenstorrent.com`:
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: one-4x2
+spec:
+  devices:
+    requests:
+      - name: mesh
+        exactly:
+          deviceClassName: mesh.tenstorrent.com
+          selectors:
+            - cel:
+                expression: |-
+                  device.attributes["tenstorrent.com"].meshName == "4x2_Mesh_horizontal"
+```
+
+The container gets every `/dev/tenstorrent/<N>` node in the mesh at once. The
+`chipIDs` attribute lists them in **mesh coordinate order**: the chip at
+position `i` sits at row `i / meshCols`, column `i % meshCols`. That order is
+the point of claiming a mesh rather than a set of chips — it is what a
+runtime builds its mesh graph descriptor from.
+
+Which meshes exist is a property of the hardware, not of the claim. Today the
+driver has groupings transcribed for one platform:
+
+| Platform | Published meshes |
+| --- | --- |
+| Blackhole Galaxy rev C | four `4x2_Mesh_horizontal`, each a 4x2 spanning quadrants of two trays |
+
+Elsewhere no mesh devices are published and the `mesh.tenstorrent.com` class
+simply matches nothing. A mesh is also only published when the agent's
+reported link graph confirms the host is actually cabled the way the grouping
+describes; if it is not, the kubelet plugin logs the pair of chips that
+should have been adjacent and skips that mesh.
+
+Meshes are mutually exclusive with everything they overlap — the chips they
+cover, the trays they straddle, and any other mesh sharing a chip — through
+the same shared counters [described above](#chips-and-trays-are-mutually-exclusive).
+Two meshes that share no chip can be held at once.
+
+Set `kubeletPlugin.meshDevices=false` in the Helm chart to turn them off.
+
+### Mesh attribute reference
+
+| Attribute         | Type   | Value                                                                                       |
+| ----------------- | ------ | ------------------------------------------------------------------------------------------- |
+| `vendor`          | string | Constant `"tenstorrent.com"`.                                                               |
+| `unit`            | string | Constant `"mesh"`.                                                                          |
+| `meshName`        | string | The grouping's name, e.g. `"4x2_Mesh_horizontal"`. Select on this to pin a topology.        |
+| `meshShape`       | string | `"<rows>x<cols>"`, e.g. `"4x2"`.                                                            |
+| `meshRows`        | int    | Rows in the mesh.                                                                           |
+| `meshCols`        | int    | Columns in the mesh.                                                                        |
+| `chipIDs`         | string | Host-local chip ids in mesh coordinate order, comma-separated.                              |
+| `trayIDs`         | string | The trays the mesh spans, comma-separated, in the order they first appear.                  |
+| `uniqueID`        | string | `uniqueID` of the mesh's origin chip (position 0). Use it to pin a workload to one mesh.    |
+| `boardName`       | string | Human-readable board type, same vocabulary as for chip devices.                             |
+| `boardType`       | int    | Numeric board-type enum. Prefer `boardName`.                                                |
+| `chipArch`        | string | ASIC architecture, e.g. `"blackhole"`.                                                      |
+| `chipCount`       | int    | Total ASICs the container gets, including bundled non-MMIO siblings.                        |
+| `chipDeviceCount` | int    | How many chip devices the mesh covers, i.e. how many separately allocatable units it takes out of circulation while held. |
+
+| Capacity | Unit     | Value                                       |
+| -------- | -------- | ------------------------------------------- |
+| `memory` | BinarySI | Aggregate DRAM across every ASIC in the mesh. |
 
 ## Claim recipes
 
@@ -533,6 +611,17 @@ Each of the three pods gets its own n150 on whatever host has one free.
 - Or trays were turned off deliberately: check
   `kubeletPlugin.trayDevices` in the Helm values and the
   `ENABLE_TRAY_DEVICES` env var on the DaemonSet.
+
+**No `mesh.tenstorrent.com` devices in `kubectl get resourceslice`.**
+- Meshes are only published on platforms the driver has groupings for. On
+  anything else the DeviceClass exists but matches nothing; this is expected.
+- Everything that suppresses tray devices suppresses meshes too, since both
+  rely on shared counters. Check the same `DRAPartitionableDevices` error,
+  and `kubeletPlugin.meshDevices` / `ENABLE_MESH_DEVICES`.
+- On a platform that should have them, look for a `not cabled the way the
+  grouping describes` error in the kubelet-plugin logs: it names the two
+  chips that should have been adjacent and were not. That is a cabling or
+  discovery problem on the host, not a configuration one.
 
 **Pod scheduled but `/dev/tenstorrent` empty.**
 - The CDI edits are still evolving. Confirm the driver version and check the
