@@ -1,6 +1,6 @@
 # Publishing PGD meshes as DRA devices
 
-Status: proposal. Nothing here is implemented yet.
+Status: phase 1 is implemented. Phases 2 and 3 are proposals.
 
 ## Problem
 
@@ -94,9 +94,9 @@ the repository alone:
    with HALFTRAY_1 instance *i*. Checkable against `local_connections` on a
    real host, which is also how phase 2 validates itself at runtime.
 
-## Phase 1 — per-chip counters
+## Phase 1 — per-chip counters (done)
 
-Prerequisite for everything else. The current scheme gives each tray one
+Prerequisite for everything else. The scheme it replaced gave each tray one
 counter sized to its chip count, with a chip consuming one unit and the tray
 device consuming all of them. That cannot express a mesh: consuming four
 units of tray 2's counter reserves *four of its eight* chips, not *which*
@@ -111,16 +111,20 @@ special case.
 
 Counter packing, given the two-consumptions limit:
 
-- Fill counter sets in chip-id order, so a tray's chips stay within one set.
+- Pack a whole tray at a time, starting a new set rather than straddling the
+  boundary, so a device covering one tray — or a few adjacent ones — spends
+  as little of its two-set budget as possible.
 - One set covers a 32-chip galaxy host exactly; a composite there always
   costs one consumption entry.
 - A composite that would span more than two sets is not publishable. Skip it
   and log it rather than publishing a device whose exclusion the apiserver
   will not carry.
-- Hosts past roughly 64 chip devices fall back to chips and trays only.
 
-This phase changes no observable behaviour beyond counter naming; the
-existing allocator tests should pass with the names updated.
+As implemented, this changes no observable behaviour beyond counter naming
+(`tt-trays-<i>`/`tray-<id>` became `tt-chips-<i>`/`chip-<id>`): the existing
+allocator tests pass unchanged. The one new behaviour is the dropped tray —
+a tray whose chips span three sets, which takes more than 64 chip devices on
+one tray to reach.
 
 ## Phase 2 — hardcoded `4x2_Mesh_horizontal`
 

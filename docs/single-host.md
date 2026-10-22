@@ -127,10 +127,11 @@ one view of a tray can be in use at a time:
 - Chips on *other* trays are unaffected, and two chips on the same tray can
   still be held by different claims.
 
-The driver enforces this by publishing one shared counter per tray, sized to
-the number of chip devices on it: each chip device consumes one unit, the tray
-device consumes all of them. The scheduler does the arithmetic, so a blocked
-claim simply stays `Pending` — it never lands on hardware someone else holds.
+The driver enforces this by publishing one shared counter per chip device,
+worth a single unit. A chip device consumes its own counter; the tray device
+consumes the counter of every chip on the tray. The scheduler does the
+arithmetic, so a blocked claim simply stays `Pending` — it never lands on
+hardware someone else holds.
 
 ```{important}
 Shared counters need the `DRAPartitionableDevices` feature gate on the API
@@ -520,8 +521,9 @@ Each of the three pods gets its own n150 on whatever host has one free.
 **Tray claim stays `Pending` on a host that looks idle.**
 - A tray is blocked by *any* allocated chip on it. Check for claims holding
   its chips: `kubectl get resourceclaim -A -o yaml | grep -B5 'device: tt-'`.
-- Conversely, a chip claim stays pending while its tray is held. The chip and
-  tray devices of one tray share a counter and cannot both be in use.
+- Conversely, a chip claim stays pending while its tray is held. A tray device
+  holds the counter of every chip on it, so the two views cannot both be in
+  use.
 
 **No `tray.tenstorrent.com` devices in `kubectl get resourceslice`.**
 - The driver falls back to per-chip devices when the API server drops
