@@ -125,6 +125,9 @@ spec:
         # Whether to advertise whole trays alongside individual chips.
         - name: ENABLE_TRAY_DEVICES
           value: "true"
+        # Whether to advertise known multi-chip meshes alongside them.
+        - name: ENABLE_MESH_DEVICES
+          value: "true"
         - name: HEALTHCHECK_PORT
           value: "51515"
         - name: POD_UID
@@ -184,10 +187,10 @@ metadata:
   name: example.tenstorrent.com
 spec:
   extendedResourceName: tenstorrent.com/chip
-  # The driver publishes two kinds of device into the same pool: one per
-  # chip and one per physical tray. The `unit` attribute tells them apart,
-  # so this class pins it to "chip" and a request for a chip can never
-  # bind a whole tray.
+  # The driver publishes several kinds of device into the same pool: one
+  # per chip, one per physical tray, and one per known multi-chip mesh.
+  # The `unit` attribute tells them apart, so this class pins it to "chip"
+  # and a request for a chip can never bind a tray or a mesh.
   #
   # The has() guard keeps this class matching devices published by driver
   # versions that predate the `unit` attribute (e.g. mid rolling update):
@@ -217,3 +220,25 @@ spec:
         device.driver == 'example.tenstorrent.com' &&
         has(device.attributes['example.tenstorrent.com'].unit) &&
         device.attributes['example.tenstorrent.com'].unit == 'tray'
+---
+# Source: tt-dra-driver/templates/deviceclass.yaml
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: mesh.example.tenstorrent.com
+spec:
+  extendedResourceName: tenstorrent.com/mesh
+  # A mesh device covers a set of chips wired into a specific topology,
+  # published in mesh coordinate order. Like a tray it is kept exclusive
+  # with the chips it covers through shared counters, so a mesh claim and
+  # a chip claim never end up on the same silicon.
+  #
+  # Narrow a claim to one topology with a selector on `meshName` (the
+  # grouping's name, e.g. "4x2_Mesh_horizontal") or on the `meshRows` and
+  # `meshCols` attributes.
+  selectors:
+  - cel:
+      expression: >-
+        device.driver == 'example.tenstorrent.com' &&
+        has(device.attributes['example.tenstorrent.com'].unit) &&
+        device.attributes['example.tenstorrent.com'].unit == 'mesh'

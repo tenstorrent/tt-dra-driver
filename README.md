@@ -37,21 +37,28 @@ discovery endpoint to enumerate devices and register `ResourceSlice` objects.
 
 ## Allocatable units
 
-The driver advertises the same hardware at two granularities:
+The driver advertises the same hardware at three granularities:
 
 * **chips** — one device per MMIO-anchored chip bundle, in the
   `tenstorrent.com` DeviceClass (extended resource `tenstorrent.com/chip`).
 * **trays** — one device per physical tray, in the `tray.tenstorrent.com`
   DeviceClass (extended resource `tenstorrent.com/tray`). Allocating it hands
   the container every chip on the tray.
+* **meshes** — one device per multi-chip topology the host's platform is
+  known to wire up, in the `mesh.tenstorrent.com` DeviceClass (extended
+  resource `tenstorrent.com/mesh`). Allocating it hands the container every
+  chip in the mesh, in mesh coordinate order. Only platforms the driver has
+  groupings for publish any; today that is the Blackhole Galaxy rev C.
 
-The two are mutually exclusive per tray: a tray cannot be allocated while any
-of its chips is in use, and no chip of a tray can be allocated while the tray
-is. This is expressed with DRA partitionable-device shared counters, so the
+The views are mutually exclusive wherever they overlap: a tray cannot be
+allocated while any of its chips is in use, a chip cannot be allocated while
+a tray or mesh covering it is, and two meshes sharing a chip cannot both be.
+This is expressed with DRA partitionable-device shared counters, so the
 scheduler enforces it. It needs the `DRAPartitionableDevices` feature gate
 (default on since Kubernetes 1.36); when the API server drops the counters the
-driver logs an error and publishes chips only. Trays can also be turned off
-with `--enable-tray-devices=false` (Helm: `kubeletPlugin.trayDevices=false`).
+driver logs an error and publishes chips only. Trays and meshes can also be
+turned off with `--enable-tray-devices=false` / `--enable-mesh-devices=false`
+(Helm: `kubeletPlugin.trayDevices`, `kubeletPlugin.meshDevices`).
 
 See [docs/single-host.md](docs/single-host.md) for claim recipes and the full
 attribute reference.

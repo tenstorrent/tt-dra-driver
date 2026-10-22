@@ -45,7 +45,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -75,12 +74,14 @@ const DefaultDriverName = "tenstorrent.com"
 const Vendor = "tenstorrent"
 
 // Values of the `unit` device attribute, which says what a device stands
-// for: a single MMIO-anchored chip bundle, or a whole physical tray.
-// DeviceClasses use it to keep the two apart, since both are published by
-// the same driver into the same pool.
+// for: a single MMIO-anchored chip bundle, a whole physical tray, or a
+// mesh of chips wired into a specific topology. DeviceClasses use it to
+// keep the three apart, since all are published by the same driver into
+// the same pool.
 const (
 	UnitChip = "chip"
 	UnitTray = "tray"
+	UnitMesh = "mesh"
 )
 
 // devicePathFmt is the path of the per-ASIC character device created by the
@@ -175,6 +176,15 @@ type Options struct {
 	// the counters and the scheduler would happily hand out a tray and
 	// its chips at the same time.
 	TrayDevices bool
+
+	// MeshDevices publishes one device per mesh of chips the host's
+	// platform is known to wire up, letting a claim take a multi-chip
+	// topology as one unit. Only platforms with transcribed groupings
+	// publish anything; see mesh.go.
+	//
+	// Mesh devices are composites like tray devices and carry the same
+	// requirement on shared counters.
+	MeshDevices bool
 }
 
 // Profile is the Tenstorrent device profile.
@@ -187,6 +197,7 @@ type Profile struct {
 	nodeName    string
 	topology    fabricmanager.TopologyClient
 	trayDevices bool
+	meshDevices bool
 
 	mu           sync.RWMutex
 	unitByDevice map[string]allocatableUnit
@@ -195,13 +206,15 @@ type Profile struct {
 // NewProfile constructs a Tenstorrent profile that publishes one
 // ResourceSlice device per MMIO-capable ASIC reported by the fabric
 // manager agent on the given node, plus one device per physical tray when
-// opts.TrayDevices is set. The topology client must be non-nil; pass a
-// *fabricmanager.AgentClient in production and a fake in tests.
+// opts.TrayDevices is set and one per known mesh when opts.MeshDevices is.
+// The topology client must be non-nil; pass a *fabricmanager.AgentClient in
+// production and a fake in tests.
 func NewProfile(nodeName string, topology fabricmanager.TopologyClient, opts Options) *Profile {
 	return &Profile{
 		nodeName:     nodeName,
 		topology:     topology,
 		trayDevices:  opts.TrayDevices,
+		meshDevices:  opts.MeshDevices,
 		unitByDevice: make(map[string]allocatableUnit),
 	}
 }
@@ -274,7 +287,7 @@ func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, l
 	// chips they cover, so a chips-only profile publishes none at all and
 	// keeps the ResourceSlice free of partitionable-device fields.
 	var layout counterLayout
-	if p.trayDevices {
+	if p.trayDevices || p.meshDevices {
 		layout = buildChipCounterSets(trays)
 	}
 
@@ -283,7 +296,7 @@ func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, l
 	// Chip devices come first, in ascending chip-id order, so that the
 	// ResourceSlice ordering (which the allocator uses as its first-fit
 	// preference) is stable across calls and unchanged by the addition
-	// of tray devices.
+	// of composite devices.
 	devices := make([]resourceapi.Device, 0, len(bundles)+len(trays))
 	for _, bundle := range bundles {
 		device := chipDevice(bundle, layout)
@@ -294,6 +307,7 @@ func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, l
 			bundles: []hostBundle{bundle},
 		}
 	}
+	trayDevices := 0
 	if p.trayDevices {
 		for _, tray := range trays {
 			device, ok := trayDevice(tray, layout, logger)
@@ -301,11 +315,21 @@ func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, l
 				continue
 			}
 			devices = append(devices, device)
+			trayDevices++
 			unitByDevice[device.Name] = allocatableUnit{
 				kind:    UnitTray,
 				trayID:  tray.trayID,
 				bundles: tray.bundles,
 			}
+		}
+	}
+	meshDevices := 0
+	if p.meshDevices {
+		meshes, units := buildMeshDevices(hostTopology, bundles, layout, logger)
+		devices = append(devices, meshes...)
+		meshDevices = len(meshes)
+		for name, unit := range units {
+			unitByDevice[name] = unit
 		}
 	}
 
@@ -315,7 +339,8 @@ func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, l
 
 	logger.V(2).Info("Enumerated Tenstorrent allocatable units",
 		"chipDevices", len(bundles),
-		"trayDevices", len(devices)-len(bundles),
+		"trayDevices", trayDevices,
+		"meshDevices", meshDevices,
 		"trays", len(trays),
 		"counters", len(layout.setByChip),
 		"counterSets", len(layout.sets),
@@ -743,11 +768,16 @@ func chipDevice(bundle hostBundle, layout counterLayout) resourceapi.Device {
 			chipIDs = append(chipIDs, fmt.Sprintf("%d", r.GetChipId()))
 			uniqueIDs = append(uniqueIDs, fmt.Sprintf("%d", r.GetUniqueId()))
 		}
+		// Both lists are elided rather than truncated mid-id when they
+		// outgrow the API's attribute value limit: a single over-long
+		// value makes the apiserver reject the whole slice, taking every
+		// device on the node with it. A bundle big enough for that is
+		// exotic, but the failure would not be.
 		device.Attributes["remoteChipIDs"] = resourceapi.DeviceAttribute{
-			StringValue: ptr.To(strings.Join(chipIDs, ",")),
+			StringValue: ptr.To(joinAttrList(chipIDs)),
 		}
 		device.Attributes["remoteUniqueIDs"] = resourceapi.DeviceAttribute{
-			StringValue: ptr.To(strings.Join(uniqueIDs, ",")),
+			StringValue: ptr.To(joinAttrList(uniqueIDs)),
 		}
 	}
 	if total := bundlesMemoryBytes([]hostBundle{bundle}); total > 0 {

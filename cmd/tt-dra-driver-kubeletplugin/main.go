@@ -64,6 +64,7 @@ type Flags struct {
 	podUID                        string
 	fabricManagerAgentAddress     string
 	enableTrayDevices             bool
+	enableMeshDevices             bool
 }
 
 // Config is the runtime configuration assembled from Flags.
@@ -81,6 +82,7 @@ var validProfiles = map[string]func(flags Flags, agent fabricmanager.TopologyCli
 	tenstorrent.ProfileName: func(f Flags, agent fabricmanager.TopologyClient) profiles.Profile {
 		return tenstorrent.NewProfile(f.nodeName, agent, tenstorrent.Options{
 			TrayDevices: f.enableTrayDevices,
+			MeshDevices: f.enableMeshDevices,
 		})
 	},
 }
@@ -186,6 +188,16 @@ func newApp() *cli.App {
 			Destination: &flags.enableTrayDevices,
 			EnvVars:     []string{"ENABLE_TRAY_DEVICES"},
 		},
+		&cli.BoolFlag{
+			Name: "enable-mesh-devices",
+			Usage: "Publish one allocatable device per multi-chip mesh the host's platform is known to wire up, in addition to the per-chip devices. " +
+				"Only platforms the driver has groupings for publish anything, so this is a no-op elsewhere. " +
+				"Mesh devices are kept mutually exclusive with the chips they cover through ResourceSlice shared counters, " +
+				"which requires the DRAPartitionableDevices feature gate on the apiserver and the scheduler.",
+			Value:       true,
+			Destination: &flags.enableMeshDevices,
+			EnvVars:     []string{"ENABLE_MESH_DEVICES"},
+		},
 		&cli.StringFlag{
 			Name:        "pod-uid",
 			Usage:       "UID of the pod (used for seamless upgrades to create unique socket names).",
@@ -237,10 +249,10 @@ func newApp() *cli.App {
 				return fmt.Errorf("connect to fabric manager agent: %w", err)
 			}
 
-			// Confirm against the apiserver that whole-tray devices can
+			// Confirm against the apiserver that composite devices can
 			// be published safely before the profile is built around
 			// them.
-			flags.enableTrayDevices = resolveTrayDevices(ctx, clientSets.Core, flags)
+			flags.enableTrayDevices, flags.enableMeshDevices = resolveCompositeDevices(ctx, clientSets.Core, flags)
 
 			config := &Config{
 				flags:             flags,
