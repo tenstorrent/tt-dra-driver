@@ -53,6 +53,7 @@ const (
 const (
 	chipClassName = "tenstorrent.com"
 	trayClassName = "tray.tenstorrent.com"
+	meshClassName = "mesh.tenstorrent.com"
 )
 
 // fakeTopologyClient hands out a watch the test drives directly.
@@ -806,7 +807,10 @@ func testDeviceClasses() deviceClasses {
 	tray := fmt.Sprintf(
 		`device.driver == '%[1]s' && has(device.attributes['%[1]s'].unit) && device.attributes['%[1]s'].unit == 'tray'`,
 		DefaultDriverName)
-	return deviceClasses{class(chipClassName, chip), class(trayClassName, tray)}
+	mesh := fmt.Sprintf(
+		`device.driver == '%[1]s' && has(device.attributes['%[1]s'].unit) && device.attributes['%[1]s'].unit == 'mesh'`,
+		DefaultDriverName)
+	return deviceClasses{class(chipClassName, chip), class(trayClassName, tray), class(meshClassName, mesh)}
 }
 
 // chipSelector and traySelector pin a request to one specific chip or
@@ -818,6 +822,13 @@ func chipSelector(chipID int) string {
 
 func traySelector(trayID int) string {
 	return fmt.Sprintf("device.attributes[%q].trayID == %d", DefaultDriverName, trayID)
+}
+
+// meshSelector pins a request to the mesh anchored on a given chip. A mesh
+// is identified by its origin chip's uniqueID, the same way a tray is
+// identified by its representative chip's.
+func meshSelector(originChipID uint32) string {
+	return fmt.Sprintf("device.attributes[%q].uniqueID == %q", DefaultDriverName, fmt.Sprintf("%d", 1000+originChipID))
 }
 
 // claimFor builds a claim for count devices of the given class, optionally
