@@ -36,7 +36,7 @@
 // makes every chip on it unallocatable, and a single allocated chip makes
 // its tray unallocatable. That exclusion is expressed with DRA
 // partitionable-device counters (KEP-4815) and is therefore enforced by
-// the scheduler, not by this driver; see buildTrayCounterSets.
+// the scheduler, not by this driver; see buildChipCounterSets.
 package tenstorrent
 
 import (
@@ -145,8 +145,8 @@ type hostBundle struct {
 }
 
 // trayGroup is every bundle that sits on one physical tray, in ascending
-// MMIO chip-id order. It backs both the tray ResourceSlice device and the
-// counter that keeps that device mutually exclusive with its chips.
+// MMIO chip-id order. It backs the tray ResourceSlice device, which is a
+// composite over exactly those bundles.
 type trayGroup struct {
 	trayID  uint32
 	bundles []hostBundle
@@ -270,13 +270,12 @@ func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, l
 	bundles := bundleHostASICs(hostTopology.GetAsics(), logger)
 	trays := groupBundlesByTray(bundles)
 
-	// Counters only exist to keep tray devices exclusive with their
-	// chips, so a chips-only profile publishes none at all and keeps the
-	// ResourceSlice free of partitionable-device fields.
-	var counterSets []resourceapi.CounterSet
-	var counterSetByTray map[uint32]string
+	// Counters only exist to keep composite devices exclusive with the
+	// chips they cover, so a chips-only profile publishes none at all and
+	// keeps the ResourceSlice free of partitionable-device fields.
+	var layout counterLayout
 	if p.trayDevices {
-		counterSets, counterSetByTray = buildTrayCounterSets(trays)
+		layout = buildChipCounterSets(trays)
 	}
 
 	unitByDevice := make(map[string]allocatableUnit, len(bundles)+len(trays))
@@ -287,18 +286,20 @@ func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, l
 	// of tray devices.
 	devices := make([]resourceapi.Device, 0, len(bundles)+len(trays))
 	for _, bundle := range bundles {
-		trayID := bundle.mmio.GetTrayId()
-		device := chipDevice(bundle, counterSetByTray[trayID])
+		device := chipDevice(bundle, layout)
 		devices = append(devices, device)
 		unitByDevice[device.Name] = allocatableUnit{
 			kind:    UnitChip,
-			trayID:  trayID,
+			trayID:  bundle.mmio.GetTrayId(),
 			bundles: []hostBundle{bundle},
 		}
 	}
 	if p.trayDevices {
 		for _, tray := range trays {
-			device := trayDevice(tray, counterSetByTray[tray.trayID], logger)
+			device, ok := trayDevice(tray, layout, logger)
+			if !ok {
+				continue
+			}
 			devices = append(devices, device)
 			unitByDevice[device.Name] = allocatableUnit{
 				kind:    UnitTray,
@@ -316,13 +317,14 @@ func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, l
 		"chipDevices", len(bundles),
 		"trayDevices", len(devices)-len(bundles),
 		"trays", len(trays),
-		"counterSets", len(counterSets),
+		"counters", len(layout.setByChip),
+		"counterSets", len(layout.sets),
 	)
 
 	return resourceslice.DriverResources{
 		Pools: map[string]resourceslice.Pool{
 			p.nodeName: {
-				Slices: buildSlices(devices, counterSets),
+				Slices: buildSlices(devices, layout.sets),
 			},
 		},
 	}
@@ -512,41 +514,129 @@ func chipIDsOf(asics []*topologypb.AsicInfo) []uint32 {
 	return ids
 }
 
-// buildTrayCounterSets defines the shared counters that make a tray device
-// and the chip devices on that tray mutually exclusive.
+// counterLayout is the published shared counters plus the index that says
+// which set holds a given chip device's counter. It is the whole of what a
+// composite device needs in order to declare what it takes out of
+// circulation.
+type counterLayout struct {
+	sets []resourceapi.CounterSet
+
+	// setByChip maps a chip device's host-local chip id to the name of
+	// the counter set holding its counter.
+	setByChip map[uint32]string
+}
+
+// buildChipCounterSets defines the shared counters that keep composite
+// devices — today the tray devices — mutually exclusive with the chip
+// devices they cover.
 //
-// Every tray gets exactly one counter, `tray-<trayID>`, whose value is the
-// number of chip devices on the tray. A chip device consumes one unit of
-// its tray's counter; the tray device consumes all of them. The scheduler
-// therefore rejects a tray whenever any of its chips is already allocated
-// (the counter is short by at least one), and rejects every chip once the
-// tray is allocated (the counter is fully drained) — which is exactly the
-// exclusion this profile needs, without the driver having to track
-// allocations itself.
+// Every chip device gets exactly one counter, `chip-<chipID>`, worth one
+// unit. A chip device consumes its own counter; a composite consumes one
+// unit of the counter of every chip device it covers. The scheduler
+// therefore rejects a composite whenever any chip inside it is already
+// allocated, and rejects a chip once any composite covering it is — which
+// is exactly the exclusion this profile needs, without the driver having
+// to track allocations itself.
 //
-// The counters are spread over as many counter sets as needed to respect
-// the per-set counter limit; the returned map says which set holds a given
-// tray's counter.
-func buildTrayCounterSets(trays []trayGroup) ([]resourceapi.CounterSet, map[uint32]string) {
-	counterSetByTray := make(map[uint32]string, len(trays))
+// Counting per chip rather than per tray is what lets a composite cover
+// part of a tray. A single counter sized to the tray's chip count can only
+// say how *many* of its chips are held, not *which*, so a device covering
+// four chips of an eight-chip tray would not stop those same four from
+// being handed out individually.
+//
+// Counters are packed into sets a whole tray at a time, so that a device
+// covering one tray — or a few adjacent ones — touches as few sets as
+// possible. That matters because
+// ResourceSliceMaxDeviceCounterConsumptionsPerDevice caps how many sets
+// one device may draw from; see chipCounterConsumption.
+func buildChipCounterSets(trays []trayGroup) counterLayout {
+	layout := counterLayout{setByChip: make(map[uint32]string)}
 	if len(trays) == 0 {
-		return nil, counterSetByTray
+		return layout
 	}
 
-	var counterSets []resourceapi.CounterSet
-	for chunk := range slices.Chunk(trays, resourceapi.ResourceSliceMaxCountersPerCounterSet) {
-		name := counterSetName(len(counterSets))
-		counters := make(map[string]resourceapi.Counter, len(chunk))
-		for _, tray := range chunk {
-			counters[counterNameForTray(tray.trayID)] = newCounter(int64(len(tray.bundles)))
-			counterSetByTray[tray.trayID] = name
+	const maxPerSet = resourceapi.ResourceSliceMaxCountersPerCounterSet
+	counters := make(map[string]resourceapi.Counter)
+	flush := func() {
+		if len(counters) == 0 {
+			return
 		}
-		counterSets = append(counterSets, resourceapi.CounterSet{
-			Name:     name,
+		layout.sets = append(layout.sets, resourceapi.CounterSet{
+			Name:     counterSetName(len(layout.sets)),
 			Counters: counters,
 		})
+		counters = make(map[string]resourceapi.Counter)
 	}
-	return counterSets, counterSetByTray
+
+	for _, tray := range trays {
+		// Start a new set rather than splitting a tray across two,
+		// unless the tray is too big to fit in a set of its own.
+		if len(counters) > 0 && len(counters)+len(tray.bundles) > maxPerSet {
+			flush()
+		}
+		for _, bundle := range tray.bundles {
+			if len(counters) == maxPerSet {
+				flush()
+			}
+			chipID := bundle.mmio.GetChipId()
+			counters[counterNameForChip(chipID)] = newCounter(1)
+			layout.setByChip[chipID] = counterSetName(len(layout.sets))
+		}
+	}
+	flush()
+	return layout
+}
+
+// chipCounterConsumption declares that a device holds every chip device in
+// bundles for as long as it is allocated, by consuming one unit of each of
+// their counters. Chip devices pass their own single bundle; composites
+// pass everything they cover.
+//
+// Consumption is declared per counter set, and a device may draw from at
+// most ResourceSliceMaxDeviceCounterConsumptionsPerDevice of them. A
+// composite spread wider than that cannot express its exclusion at all, so
+// it reports false and the caller drops the device: publishing it with a
+// partial declaration would advertise silicon the scheduler believes is
+// free.
+//
+// It returns nil, true when no counters were published at all (tray
+// devices disabled), leaving the device free of partitionable-device
+// fields.
+func chipCounterConsumption(layout counterLayout, bundles []hostBundle) ([]resourceapi.DeviceCounterConsumption, bool) {
+	if len(layout.sets) == 0 {
+		return nil, true
+	}
+
+	// Set order follows first use, so the result is deterministic for a
+	// given bundle order and the published slice is stable across calls.
+	var order []string
+	bySet := make(map[string]map[string]resourceapi.Counter)
+	for _, bundle := range bundles {
+		chipID := bundle.mmio.GetChipId()
+		set, ok := layout.setByChip[chipID]
+		if !ok {
+			// A chip with no counter cannot be held exclusively, so a
+			// device covering it cannot be published correctly either.
+			return nil, false
+		}
+		if _, seen := bySet[set]; !seen {
+			order = append(order, set)
+			bySet[set] = make(map[string]resourceapi.Counter)
+		}
+		bySet[set][counterNameForChip(chipID)] = newCounter(1)
+	}
+	if len(order) > resourceapi.ResourceSliceMaxDeviceCounterConsumptionsPerDevice {
+		return nil, false
+	}
+
+	consumption := make([]resourceapi.DeviceCounterConsumption, 0, len(order))
+	for _, set := range order {
+		consumption = append(consumption, resourceapi.DeviceCounterConsumption{
+			CounterSet: set,
+			Counters:   bySet[set],
+		})
+	}
+	return consumption, true
 }
 
 // buildSlices packs devices and counter sets into ResourceSlices that stay
@@ -582,16 +672,19 @@ func buildSlices(devices []resourceapi.Device, counterSets []resourceapi.Counter
 
 // chipDevice converts a hostBundle into a ResourceSlice device. The device
 // name uses the MMIO parent's host-local chip id so it is stable across
-// agent restarts on the same host. counterSet names the counter set
-// holding this chip's tray counter, or is empty when tray devices are
-// disabled and no counters are published.
-func chipDevice(bundle hostBundle, counterSet string) resourceapi.Device {
+// agent restarts on the same host. layout carries the chip counters, and
+// is empty when tray devices are disabled and no counters are published.
+//
+// A chip device always has a counter of its own in the layout, so unlike a
+// composite it can never fail to declare its consumption.
+func chipDevice(bundle hostBundle, layout counterLayout) resourceapi.Device {
 	mmio := bundle.mmio
+	consumption, _ := chipCounterConsumption(layout, []hostBundle{bundle})
 	device := resourceapi.Device{
 		Name: deviceNameForChip(mmio.GetChipId()),
-		// A chip device holds one unit of its tray's counter for as long
-		// as it is allocated, which is what blocks the tray device.
-		ConsumesCounters: trayCounterConsumption(counterSet, mmio.GetTrayId(), 1),
+		// A chip device holds its own counter for as long as it is
+		// allocated, which is what blocks every composite covering it.
+		ConsumesCounters: consumption,
 		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 			"vendor": {
 				StringValue: ptr.To(Vendor),
@@ -670,17 +763,34 @@ func chipDevice(bundle hostBundle, counterSet string) resourceapi.Device {
 // trayDevice converts a trayGroup into the ResourceSlice device that
 // represents the whole physical tray. Allocating it grants the container
 // every MMIO chip on the tray at once (plus their bundled remotes) and,
-// through the tray counter, takes the tray's chip devices out of the
+// through the chip counters, takes the tray's chip devices out of the
 // allocatable set.
+//
+// It returns false when the tray's chips are spread across more counter
+// sets than one device may draw from, which is the one case where the
+// exclusion cannot be declared; the tray is then not published at all.
 //
 // Board-identity attributes (boardType, boardName, chipArch) describe the
 // tray as a whole and are taken from its lowest-chip-id bundle. A tray is
 // one physical board, so those values are expected to agree across its
 // chips; a tray that disagrees is logged and still described by that
 // representative chip.
-func trayDevice(tray trayGroup, counterSet string, logger klog.Logger) resourceapi.Device {
+func trayDevice(tray trayGroup, layout counterLayout, logger klog.Logger) (resourceapi.Device, bool) {
 	representative := tray.bundles[0].mmio
 	warnIfHeterogeneous(tray, logger)
+
+	// The tray device holds one unit of every chip counter on the tray:
+	// while it is allocated no chip device on the tray can be, and it
+	// cannot be allocated while any of them is.
+	consumption, ok := chipCounterConsumption(layout, tray.bundles)
+	if !ok {
+		logger.Error(nil, "Not publishing a Tenstorrent tray device: its chips span more counter sets than one device may consume from, so the tray could not be kept exclusive with them",
+			"trayID", tray.trayID,
+			"chipDevices", len(tray.bundles),
+			"maxCounterSetsPerDevice", resourceapi.ResourceSliceMaxDeviceCounterConsumptionsPerDevice,
+		)
+		return resourceapi.Device{}, false
+	}
 
 	chipCount := 0
 	for _, bundle := range tray.bundles {
@@ -688,11 +798,8 @@ func trayDevice(tray trayGroup, counterSet string, logger klog.Logger) resourcea
 	}
 
 	device := resourceapi.Device{
-		Name: deviceNameForTray(tray.trayID),
-		// The tray device consumes its tray counter in full: while it is
-		// allocated no chip device on the tray can be, and it cannot be
-		// allocated while any of them is.
-		ConsumesCounters: trayCounterConsumption(counterSet, tray.trayID, int64(len(tray.bundles))),
+		Name:             deviceNameForTray(tray.trayID),
+		ConsumesCounters: consumption,
 		Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
 			"vendor": {
 				StringValue: ptr.To(Vendor),
@@ -738,7 +845,7 @@ func trayDevice(tray trayGroup, counterSet string, logger klog.Logger) resourcea
 			},
 		}
 	}
-	return device
+	return device, true
 }
 
 // warnIfHeterogeneous logs when the chips on one tray disagree about board
@@ -763,27 +870,8 @@ func warnIfHeterogeneous(tray trayGroup, logger klog.Logger) {
 	}
 }
 
-// trayCounterConsumption declares that a device consumes count units of
-// its tray's shared counter. It returns nil when no counter set was
-// published (tray devices disabled), leaving the device free of
-// partitionable-device fields.
-func trayCounterConsumption(counterSet string, trayID uint32, count int64) []resourceapi.DeviceCounterConsumption {
-	if counterSet == "" {
-		return nil
-	}
-	return []resourceapi.DeviceCounterConsumption{
-		{
-			CounterSet: counterSet,
-			Counters: map[string]resourceapi.Counter{
-				counterNameForTray(trayID): newCounter(count),
-			},
-		},
-	}
-}
-
 // newCounter builds a shared counter quantity. Counters are plain
-// integers: the number of chip devices on a tray, or how many of them a
-// device holds.
+// integers: one unit per chip device, held by whichever device covers it.
 func newCounter(value int64) resourceapi.Counter {
 	return resourceapi.Counter{Value: *resource.NewQuantity(value, resource.DecimalSI)}
 }
@@ -818,13 +906,13 @@ func deviceNameForTray(trayID uint32) string {
 }
 
 // counterSetName returns the name of the i-th counter set published for
-// this node's trays.
+// this node's chip devices.
 func counterSetName(i int) string {
-	return fmt.Sprintf("tt-trays-%d", i)
+	return fmt.Sprintf("tt-chips-%d", i)
 }
 
-// counterNameForTray returns the name of the counter that tracks how much
-// of a tray is still free.
-func counterNameForTray(trayID uint32) string {
-	return fmt.Sprintf("tray-%d", trayID)
+// counterNameForChip returns the name of the counter that says whether a
+// chip device is still free.
+func counterNameForChip(chipID uint32) string {
+	return fmt.Sprintf("chip-%d", chipID)
 }
