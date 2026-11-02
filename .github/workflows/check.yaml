@@ -36,13 +36,13 @@ jobs:
     name: Static checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The Go version comes from go.mod so that it cannot drift from what the
       # module targets. golangci-lint refuses to load a config whose target Go
       # version is newer than the toolchain it was built with, so this also
       # keeps the linter installable.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
