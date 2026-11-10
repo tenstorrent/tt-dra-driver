@@ -295,7 +295,17 @@ func TestWatchTopologyReconnects(t *testing.T) {
 			defer cancel()
 			watch := client.WatchTopology(ctx)
 
+			// The drop is announced, so that the consumer can say the agent
+			// cannot be reached rather than keep presenting stale health.
+			dropped := recvSnapshot(t, watch)
+			if dropped.Unreachable == nil || dropped.Usable() {
+				t.Errorf("first snapshot %+v, want an unusable one with Unreachable set", dropped)
+			}
+
 			snapshot := recvSnapshot(t, watch)
+			if snapshot.Unreachable != nil {
+				t.Fatalf("second snapshot is also marked unreachable: %v", snapshot.Unreachable)
+			}
 			if got := snapshot.Topology.GetAsics()[0].GetUniqueId(); got != 42 {
 				t.Errorf("snapshot has ASIC %d, want 42 from the second attempt", got)
 			}

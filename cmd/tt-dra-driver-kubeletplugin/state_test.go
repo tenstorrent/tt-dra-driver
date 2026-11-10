@@ -65,7 +65,11 @@ func (p fakeProfile) resources() resourceslice.DriverResources {
 // cancelled, which is all the DeviceState tests need from a watch.
 func (p fakeProfile) WatchDevices(ctx context.Context) profiles.DeviceWatch {
 	watch := newFakeDeviceWatch()
-	watch.updates <- p.resources()
+	update := profiles.DeviceUpdate{Resources: p.resources(), Health: profiles.DeviceHealthByName{}}
+	for _, name := range p.deviceNames {
+		update.Health[name] = profiles.DeviceHealth{State: profiles.HealthHealthy}
+	}
+	watch.updates <- update
 	go func() {
 		<-ctx.Done()
 		watch.stop(nil)
@@ -544,16 +548,16 @@ func TestSetResources(t *testing.T) {
 
 // fakeDeviceWatch is a profiles.DeviceWatch driven by the test.
 type fakeDeviceWatch struct {
-	updates chan resourceslice.DriverResources
+	updates chan profiles.DeviceUpdate
 	err     error
 }
 
 func newFakeDeviceWatch() *fakeDeviceWatch {
-	return &fakeDeviceWatch{updates: make(chan resourceslice.DriverResources, 1)}
+	return &fakeDeviceWatch{updates: make(chan profiles.DeviceUpdate, 1)}
 }
 
-func (w *fakeDeviceWatch) Updates() <-chan resourceslice.DriverResources { return w.updates }
-func (w *fakeDeviceWatch) Err() error                                    { return w.err }
+func (w *fakeDeviceWatch) Updates() <-chan profiles.DeviceUpdate { return w.updates }
+func (w *fakeDeviceWatch) Err() error                            { return w.err }
 
 // stop closes the watch as if it had finished with err.
 func (w *fakeDeviceWatch) stop(err error) {
@@ -564,14 +568,14 @@ func (w *fakeDeviceWatch) stop(err error) {
 func TestWaitForInitialDevices(t *testing.T) {
 	t.Run("returns the first reported resources", func(t *testing.T) {
 		watch := newFakeDeviceWatch()
-		watch.updates <- resourcesWith("chip-0")
+		watch.updates <- profiles.DeviceUpdate{Resources: resourcesWith("chip-0")}
 
 		got, err := waitForInitialDevices(context.Background(), watch, time.Minute)
 		if err != nil {
 			t.Fatalf("waitForInitialDevices: unexpected error: %v", err)
 		}
-		if len(got.Pools[testNodeName].Slices[0].Devices) != 1 {
-			t.Errorf("got %+v, want the single reported device", got.Pools)
+		if len(got.Resources.Pools[testNodeName].Slices[0].Devices) != 1 {
+			t.Errorf("got %+v, want the single reported device", got.Resources.Pools)
 		}
 	})
 
