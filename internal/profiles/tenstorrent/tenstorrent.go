@@ -46,6 +46,7 @@ import (
 	"slices"
 	"sort"
 	"sync"
+	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -225,7 +226,7 @@ func (p *Profile) WatchDevices(ctx context.Context) profiles.DeviceWatch {
 		return failedWatch(errors.New("tenstorrent profile: fabric manager agent client is not configured"))
 	}
 
-	w := &deviceWatch{updates: make(chan resourceslice.DriverResources)}
+	w := &deviceWatch{updates: make(chan profiles.DeviceUpdate)}
 	go w.run(ctx, p, p.topology.WatchTopology(ctx))
 	return w
 }
@@ -233,7 +234,7 @@ func (p *Profile) WatchDevices(ctx context.Context) profiles.DeviceWatch {
 // deviceWatch converts a fabric-manager topology watch into the
 // profiles.DeviceWatch the kubelet plugin consumes.
 type deviceWatch struct {
-	updates chan resourceslice.DriverResources
+	updates chan profiles.DeviceUpdate
 
 	// err is written by run before it closes updates, and read by Err only
 	// after the close has been observed.
@@ -241,33 +242,144 @@ type deviceWatch struct {
 }
 
 // Updates implements profiles.DeviceWatch.
-func (w *deviceWatch) Updates() <-chan resourceslice.DriverResources { return w.updates }
+func (w *deviceWatch) Updates() <-chan profiles.DeviceUpdate { return w.updates }
 
 // Err implements profiles.DeviceWatch.
 func (w *deviceWatch) Err() error { return w.err }
 
-// run translates every usable topology snapshot into resources to publish.
-// Snapshots that carry no usable topology — discovery has not finished, or
-// it failed — are logged and skipped rather than forwarded as an empty
-// device set: they say nothing about the host, so the driver should keep
-// serving whatever it last published.
+// Reasons a device is reported as not healthy. They are stable tokens, safe
+// to use as label values.
+const (
+	reasonNotReported       = "not-reported"
+	reasonAgentUnreachable  = "agent-unreachable"
+	reasonTopologyUnusable  = "topology-unavailable"
+	messageNotReported      = "no longer reported by the fabric manager"
+	messageAgentUnreachable = "the fabric manager agent cannot be reached"
+)
+
+// healthTracker derives per-device health from the sequence of snapshots.
+// It is confined to the goroutine running the watch.
+type healthTracker struct {
+	// resources is the last set handed out, and names the devices in it.
+	// Nil until a usable snapshot has been seen: before that there is
+	// nothing to report health about.
+	resources *resourceslice.DriverResources
+	names     []string
+
+	// gone holds devices that were published earlier in this process's
+	// lifetime and are not any more. They are not in the ResourceSlice, but
+	// a pod may still hold one, and kubelet only learns that it is broken
+	// from the health stream. Entries leave when the device returns.
+	gone map[string]profiles.DeviceHealth
+}
+
+// observe folds a usable snapshot's resources in and returns the update to
+// send.
+func (h *healthTracker) observe(resources resourceslice.DriverResources, now time.Time) profiles.DeviceUpdate {
+	current := publishedDeviceNames(resources)
+	present := make(map[string]struct{}, len(current))
+	for _, name := range current {
+		present[name] = struct{}{}
+		delete(h.gone, name)
+	}
+	for _, name := range h.names {
+		if _, ok := present[name]; ok {
+			continue
+		}
+		if h.gone == nil {
+			h.gone = make(map[string]profiles.DeviceHealth)
+		}
+		h.gone[name] = profiles.DeviceHealth{
+			State:   profiles.HealthUnhealthy,
+			Reason:  reasonNotReported,
+			Since:   now,
+			Message: messageNotReported,
+		}
+	}
+	h.resources, h.names = &resources, current
+
+	health := make(profiles.DeviceHealthByName, len(current)+len(h.gone))
+	for _, name := range current {
+		health[name] = profiles.DeviceHealth{State: profiles.HealthHealthy}
+	}
+	for name, dh := range h.gone {
+		health[name] = dh
+	}
+	return profiles.DeviceUpdate{Resources: resources, Health: health}
+}
+
+// unknown returns the update to send when the fabric manager cannot say
+// anything about the host: the resources stay as they were, every device,
+// remembered ones included, is unknown. ok is false before the first usable
+// snapshot.
+func (h *healthTracker) unknown(reason, message string) (update profiles.DeviceUpdate, ok bool) {
+	if h.resources == nil {
+		return profiles.DeviceUpdate{}, false
+	}
+	dh := profiles.DeviceHealth{State: profiles.HealthUnknown, Reason: reason, Message: message}
+	health := make(profiles.DeviceHealthByName, len(h.names)+len(h.gone))
+	for _, name := range h.names {
+		health[name] = dh
+	}
+	for name := range h.gone {
+		health[name] = dh
+	}
+	return profiles.DeviceUpdate{Resources: *h.resources, Health: health}, true
+}
+
+// publishedDeviceNames lists the names of the devices in the pools, in slice order.
+func publishedDeviceNames(resources resourceslice.DriverResources) []string {
+	var names []string
+	for _, pool := range resources.Pools {
+		for _, slice := range pool.Slices {
+			for _, device := range slice.Devices {
+				names = append(names, device.Name)
+			}
+		}
+	}
+	return names
+}
+
+// run translates every topology snapshot into an update. Snapshots that
+// carry no usable topology — discovery has not finished, it failed, or the
+// agent could not be reached — say nothing about the host, so they are not
+// forwarded as an empty device set: the driver keeps serving whatever it last
+// published. They do change what is known about every device's health, so
+// they are forwarded as updates with the resources unchanged and the health
+// unknown.
 func (w *deviceWatch) run(ctx context.Context, p *Profile, topology fabricmanager.TopologyWatch) {
 	defer close(w.updates)
 
 	logger := klog.FromContext(ctx)
+	var tracker healthTracker
 	for snapshot := range topology.Updates() {
-		if !snapshot.Usable() {
+		var (
+			update profiles.DeviceUpdate
+			ok     = true
+		)
+		switch {
+		case snapshot.Unreachable != nil:
+			logger.Info("Fabric manager agent is unreachable", "err", snapshot.Unreachable)
+			update, ok = tracker.unknown(reasonAgentUnreachable, messageAgentUnreachable+": "+snapshot.Unreachable.Error())
+		case !snapshot.Usable():
 			logger.Info("Ignoring fabric manager topology snapshot with no usable topology",
 				"status", snapshot.Status,
 				"discoveryError", snapshot.DiscoveryError(),
 				"version", snapshot.Version,
 			)
+			cause := "topology discovery has not completed"
+			if err := snapshot.DiscoveryError(); err != "" {
+				cause = "topology discovery failed: " + err
+			}
+			update, ok = tracker.unknown(reasonTopologyUnusable, cause)
+		default:
+			update = tracker.observe(p.applyTopology(snapshot.Topology, logger), time.Now())
+		}
+		if !ok {
 			continue
 		}
-
-		resources := p.applyTopology(snapshot.Topology, logger)
 		select {
-		case w.updates <- resources:
+		case w.updates <- update:
 		case <-ctx.Done():
 			return
 		}
@@ -358,7 +470,7 @@ func (p *Profile) applyTopology(hostTopology *topologypb.HostPhysicalTopology, l
 // failedWatch returns an already-finished watch carrying err, so that a
 // misconfigured profile reports through the same path as a watch that died.
 func failedWatch(err error) profiles.DeviceWatch {
-	updates := make(chan resourceslice.DriverResources)
+	updates := make(chan profiles.DeviceUpdate)
 	close(updates)
 	return &deviceWatch{updates: updates, err: err}
 }

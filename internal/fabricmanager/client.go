@@ -109,6 +109,13 @@ type Snapshot struct {
 	// resets when the agent restarts, so it is only meaningful for ordering
 	// and logging within a single connection.
 	Version uint64
+
+	// Unreachable is set on a snapshot the client synthesizes when the
+	// stream to the agent drops, and is nil on every snapshot the agent
+	// sent. Such a snapshot carries no topology; it exists so that a
+	// consumer can tell "the agent has nothing new" from "the agent cannot
+	// be asked", which the reconnect loop would otherwise hide.
+	Unreachable error
 }
 
 // DiscoveryError returns the reason the agent could not build a usable
@@ -289,6 +296,11 @@ func (w *agentWatch) run(ctx context.Context, c *AgentClient) {
 		case transient(ctx, err):
 			delay := backoff.next()
 			logger.Info("Fabric manager topology watch dropped; reconnecting", "err", err, "delay", delay)
+			select {
+			case w.updates <- Snapshot{Unreachable: err}:
+			case <-ctx.Done():
+				return
+			}
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():

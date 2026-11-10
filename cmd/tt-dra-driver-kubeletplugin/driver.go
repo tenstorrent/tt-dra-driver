@@ -32,8 +32,8 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	coreclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
-	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
+	drahealthv1alpha1 "k8s.io/kubelet/pkg/apis/dra-health/v1alpha1"
 
 	"github.com/tenstorrent/tt-dra-driver/internal/profiles"
 )
@@ -41,11 +41,14 @@ import (
 // driver is the kubelet plugin handler that satisfies the
 // kubeletplugin.DRAPlugin interface.
 type driver struct {
-	client      coreclientset.Interface
-	helper      *kubeletplugin.Helper
-	state       *DeviceState
-	healthcheck *healthcheck
-	cancelCtx   func(error)
+	drahealthv1alpha1.UnimplementedDRAResourceHealthServer
+
+	client    coreclientset.Interface
+	helper    *kubeletplugin.Helper
+	state     *DeviceState
+	health    *healthHub
+	liveness  *liveness
+	cancelCtx func(error)
 }
 
 // initialDevicesTimeout bounds how long NewDriver waits for the profile's
@@ -61,7 +64,7 @@ var initialDevicesTimeout = 5 * time.Minute
 
 // NewDriver wires up the kubelet plugin: it waits for the profile's first
 // report of the node's devices, builds the device state, starts the
-// kubeletplugin helper, optionally starts the healthcheck server, publishes
+// kubeletplugin helper, optionally starts the liveness server, publishes
 // the resource slices and then keeps them in sync with the profile for as
 // long as ctx lives.
 func NewDriver(ctx context.Context, config *Config) (*driver, error) {
@@ -74,13 +77,14 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 	}
 
 	watch := config.profile.WatchDevices(ctx)
-	driverResources, err := waitForInitialDevices(ctx, watch, initialDevicesTimeout)
+	initial, err := waitForInitialDevices(ctx, watch, initialDevicesTimeout)
 	if err != nil {
 		return nil, err
 	}
+	d.health = newHealthHub(config.flags.nodeName, initial.Health)
 
 	stateStart := time.Now()
-	state, err := NewDeviceState(ctx, config, driverResources)
+	state, err := NewDeviceState(ctx, config, initial.Resources)
 	if err != nil {
 		return nil, err
 	}
@@ -102,9 +106,9 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 	d.helper = helper
 	logger.Info("Started the kubelet plugin helper", "duration", time.Since(helperStart))
 
-	d.healthcheck, err = startHealthcheck(ctx, config)
+	d.liveness, err = startLiveness(ctx, config)
 	if err != nil {
-		return nil, fmt.Errorf("start healthcheck: %w", err)
+		return nil, fmt.Errorf("start liveness service: %w", err)
 	}
 
 	// Until this returns, the scheduler cannot allocate any device on this
@@ -132,7 +136,7 @@ func NewDriver(ctx context.Context, config *Config) (*driver, error) {
 // its own, so the only reasons this returns an error are the watch failing
 // permanently, the caller going away, or the source taking longer than
 // timeout to produce anything.
-func waitForInitialDevices(ctx context.Context, watch profiles.DeviceWatch, timeout time.Duration) (resourceslice.DriverResources, error) {
+func waitForInitialDevices(ctx context.Context, watch profiles.DeviceWatch, timeout time.Duration) (profiles.DeviceUpdate, error) {
 	logger := klog.FromContext(ctx)
 	logger.Info("Waiting for the initial set of devices", "timeout", timeout)
 
@@ -140,18 +144,18 @@ func waitForInitialDevices(ctx context.Context, watch profiles.DeviceWatch, time
 	defer deadline.Stop()
 
 	select {
-	case driverResources, ok := <-watch.Updates():
+	case update, ok := <-watch.Updates():
 		if !ok {
 			if err := watch.Err(); err != nil {
-				return resourceslice.DriverResources{}, fmt.Errorf("watch devices: %w", err)
+				return profiles.DeviceUpdate{}, fmt.Errorf("watch devices: %w", err)
 			}
-			return resourceslice.DriverResources{}, errors.New("device watch stopped before reporting any devices")
+			return profiles.DeviceUpdate{}, errors.New("device watch stopped before reporting any devices")
 		}
-		return driverResources, nil
+		return update, nil
 	case <-deadline.C:
-		return resourceslice.DriverResources{}, fmt.Errorf("no devices reported within %s", timeout)
+		return profiles.DeviceUpdate{}, fmt.Errorf("no devices reported within %s", timeout)
 	case <-ctx.Done():
-		return resourceslice.DriverResources{}, ctx.Err()
+		return profiles.DeviceUpdate{}, ctx.Err()
 	}
 }
 
@@ -163,7 +167,14 @@ func waitForInitialDevices(ctx context.Context, watch profiles.DeviceWatch, time
 func (d *driver) republishDevices(ctx context.Context, watch profiles.DeviceWatch) {
 	logger := klog.FromContext(ctx)
 
-	for driverResources := range watch.Updates() {
+	for update := range watch.Updates() {
+		// Health goes out first and regardless of whether the resources
+		// changed: a device going missing is exactly when a pod holding it
+		// needs to hear about it.
+		if d.health.set(update.Health) {
+			logger.V(2).Info("Device health changed")
+		}
+		driverResources := update.Resources
 		if !d.state.SetResources(driverResources) {
 			logger.V(4).Info("Devices reported by the profile are unchanged; not republishing")
 			continue
@@ -189,10 +200,10 @@ func (d *driver) republishDevices(ctx context.Context, watch profiles.DeviceWatc
 	d.HandleError(ctx, err, "Device watch stopped; the driver can no longer track topology changes")
 }
 
-// Shutdown stops the kubelet plugin helper and the healthcheck server.
+// Shutdown stops the kubelet plugin helper and the liveness server.
 func (d *driver) Shutdown(logger klog.Logger) error {
-	if d.healthcheck != nil {
-		d.healthcheck.Stop(logger)
+	if d.liveness != nil {
+		d.liveness.Stop(logger)
 	}
 	d.helper.Stop()
 	return nil
