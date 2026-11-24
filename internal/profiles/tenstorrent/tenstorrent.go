@@ -185,6 +185,13 @@ type Options struct {
 	// Mesh devices are composites like tray devices and carry the same
 	// requirement on shared counters.
 	MeshDevices bool
+
+	// Mock suppresses all host-side device access in CDI specs. When
+	// set, ApplyConfig returns empty container edits (no /dev/tenstorrent
+	// device nodes, no hugepage mounts), so PrepareResourceClaims
+	// succeeds and containers start on nodes without Tenstorrent hardware.
+	// Intended for testing the DRA scheduling and prepare/unprepare flow.
+	Mock bool
 }
 
 // Profile is the Tenstorrent device profile.
@@ -198,6 +205,7 @@ type Profile struct {
 	topology    fabricmanager.TopologyClient
 	trayDevices bool
 	meshDevices bool
+	mock        bool
 
 	mu           sync.RWMutex
 	unitByDevice map[string]allocatableUnit
@@ -215,6 +223,7 @@ func NewProfile(nodeName string, topology fabricmanager.TopologyClient, opts Opt
 		topology:     topology,
 		trayDevices:  opts.TrayDevices,
 		meshDevices:  opts.MeshDevices,
+		mock:         opts.Mock,
 		unitByDevice: make(map[string]allocatableUnit),
 	}
 }
@@ -369,7 +378,13 @@ func failedWatch(err error) profiles.DeviceWatch {
 // filesystems on the host; these are required by every ASIC and are
 // therefore declared once at the "common" level instead of being duplicated
 // per device.
+//
+// In mock mode no host paths are injected, so the common spec carries only
+// the env vars that NewCDIHandler writes unconditionally.
 func (p *Profile) CommonContainerEdits() *cdiapi.ContainerEdits {
+	if p.mock {
+		return nil
+	}
 	return &cdiapi.ContainerEdits{
 		ContainerEdits: &cdispec.ContainerEdits{
 			Mounts: []*cdispec.Mount{
@@ -413,6 +428,9 @@ func (p *Profile) Validate(config runtime.Object) error {
 // for a tray device. Because applyTopology only ever anchors units on
 // MMIO-capable ASICs (with any non-MMIO siblings bundled in), each bundle
 // corresponds to exactly one host-visible character device.
+//
+// In mock mode the device node entries are omitted so that PrepareResourceClaims
+// succeeds and containers start on nodes without /dev/tenstorrent devices.
 func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.DeviceRequestAllocationResult) (profiles.PerDeviceCDIContainerEdits, error) {
 	if config != nil {
 		return nil, errors.New("tenstorrent profile: opaque configuration is not supported yet")
@@ -426,6 +444,10 @@ func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devi
 		unit, ok := p.unitByDevice[result.Device]
 		if !ok {
 			return nil, fmt.Errorf("tenstorrent profile: device %q is not in the latest topology reported by the fabric manager agent", result.Device)
+		}
+		if p.mock {
+			edits[result.Device] = nil
+			continue
 		}
 		deviceNodes := make([]*cdispec.DeviceNode, 0, len(unit.bundles))
 		for _, bundle := range unit.bundles {
