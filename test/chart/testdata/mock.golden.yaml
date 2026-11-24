@@ -92,7 +92,7 @@ spec:
         command: ["tt-dra-driver-kubeletplugin"]
         resources:
           {}
-
+        
         livenessProbe:
           grpc:
             port: 51515
