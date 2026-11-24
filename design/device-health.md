@@ -1,7 +1,7 @@
 # Reporting device health
 
-Status: proposal. Phase 1 needs nothing from the fabric manager; phases 2
-and 3 depend on the fabric manager agent change described below.
+Status: phase 1 is implemented. Phases 2 and 3 depend on the fabric manager
+agent change described below.
 
 ## Problem
 
@@ -122,92 +122,120 @@ Choices worth stating:
 
 ## What to ask of the fabric manager
 
-Everything above needs per-ASIC and per-link health with reasons, and
-`fm-proto/topology.proto` has none of it. The agent already watches
-telemetry — `WatchTopology` notes that it triggers rediscovery "in response
-to telemetry-observed link changes" — so the request is largely to expose
-what it already observes.
+Everything above needs per-ASIC health, and `fm-proto/topology.proto` has
+none of it. This is the request as agreed with the fabric manager side so
+far; the first version is deliberately small and built to grow.
 
 ### The gaps
 
 1. **Failed ASICs vanish.** `HostPhysicalTopology.asics` holds only what
-   discovery found. The driver needs the ASICs the host is *expected* to
-   have — from PCI enumeration or the PSD — including those that failed,
-   with `chip_id`, `tray_id` and `asic_location` stable, since device names
-   are built from `chip_id`.
-2. **Down links vanish.** `local_connections` and `exit_nodes` appear to list
-   only links that came up. The driver needs every link the platform expects,
-   with its state.
-3. **No reasons or severity.** `discovery_error` is one host-wide string.
-   Taint values and the `NoExecute` decision need a machine-readable reason
-   and a transient/persistent distinction.
-4. **No freshness.** Snapshots are sent only on change, so a stalled
-   telemetry monitor is indistinguishable from a healthy host.
+   discovery found, so an ASIC that failed to probe is indistinguishable
+   from one that was never there. The driver needs the ASICs the host is
+   *expected* to have, from the factory system descriptor (FSD), including
+   those that failed.
+2. **No identity that survives failure.** `unique_id` needs the ethernet
+   subsystem to have come up, and `chip_id` is assigned during enumeration,
+   so a device that fails to probe has neither, and `chip_id` can be
+   reordered among the devices that did. The only identity available for
+   every expected ASIC is where it sits: `(tray_id, asic_location)`.
+3. **No health.** Nothing says whether an ASIC is working, and
+   `discovery_error` is one host-wide string.
+
+Link health is a gap too, and is left out of the first version; see
+"Deferred" below for what that costs.
 
 ### Requested additions
 
-A `HostHealth` message in the shared `fabricmanager.topology` package,
-carried in `WatchTopologyResponse` rather than inside
-`HostPhysicalTopology`:
+A `HostHealth` message, carried as a new field of `WatchTopologyResponse`:
 
 ```proto
+message WatchTopologyResponse {
+  // ... existing fields 1-4 ...
+
+  // Absent when the agent does not report health. Consumers must treat
+  // absence as "unknown", not as "healthy".
+  fabricmanager.topology.HostHealth health = 5;
+}
+
 message HostHealth {
+  // One entry per ASIC the FSD says this host has, whether or not it
+  // probed. Complete: an ASIC missing from this list is not expected.
   repeated AsicHealth asics = 1;
-  repeated LinkHealth links = 2;
-  // When the agent's health monitor last completed a pass, so a stalled
-  // monitor reads as stale rather than healthy.
-  int64 last_checked_unix = 3;
-  // False when the agent has no telemetry, e.g. under fallback discovery.
-  bool telemetry_available = 4;
+}
+
+enum HealthState {
+  HEALTH_STATE_UNKNOWN = 0;
+  HEALTH_STATE_HEALTHY = 1;
+  HEALTH_STATE_DEGRADED = 2;
+  HEALTH_STATE_UNHEALTHY = 3;
+}
+
+// Stable and machine-readable; the driver uses it as a taint value, so new
+// values are added, never renamed. The first version needs one.
+enum HealthReason {
+  HEALTH_REASON_UNSPECIFIED = 0;
+  HEALTH_REASON_PROBE_FAILED = 1;  // expected by the FSD, did not probe
 }
 
 message AsicHealth {
-  uint64 unique_id = 1;
-  HealthState state = 2;    // HEALTHY, DEGRADED, UNHEALTHY, UNKNOWN
-  HealthReason reason = 3;  // stable enum, see below
-  bool transient = 4;       // expected to recover without intervention
-  int64 since_unix = 5;
-  string message = 6;
-}
+  // Identity. The only fields guaranteed for a failed ASIC.
+  uint32 tray_id = 1;
+  uint32 asic_location = 2;
 
-message LinkHealth {
-  uint64 src_asic_id = 1;
-  uint32 src_channel = 2;
-  uint64 dst_asic_id = 3;
-  uint32 dst_channel = 4;
-  LinkState state = 5;      // UP, DOWN, TRAINING, DEGRADED
-  bool expected = 6;        // the platform descriptor says this link exists
-  uint32 retrain_count = 7;
-  int64 since_unix = 8;
+  // The aggregate of whatever signals the agent has, one value so that
+  // better signals can be added without changing this message.
+  HealthState state = 3;
+  HealthReason reason = 4;       // unset when HEALTHY
+  bool transient = 5;            // expected to recover without intervention
+  int64 since_unix = 6;          // when the state began; 0 if unknown
+  string message = 7;            // human-readable detail
+
+  // Facts available from enumeration without the device's cooperation.
+  // What the agent cannot tell is left zero or empty.
+  bool is_mmio_capable = 8;
+  string pci_address = 9;
+  uint32 device_node_id = 10;
+  string device_node_path = 11;
 }
 ```
 
 Why this shape:
 
-- **Same stream, separate message.** One snapshot keeps topology and health
-  consistent with each other, and avoids spending a second slot against the
-  agent's cap on open watches (`RESOURCE_EXHAUSTED`). Keeping it out of
-  `HostPhysicalTopology` leaves the controller's registration and heartbeat
-  payloads unaffected unless the fabric manager wants them there too.
-- **Expected-but-failed ASICs belong in `asics` as well**, not only in
-  `HostHealth`, so that the existing bundling and device naming keep working
-  for them unchanged.
+- **Keyed by `(tray_id, asic_location)`.** See gap 2. `unique_id` and
+  `chip_id` stay where they are, in `AsicInfo`, as facts about ASICs that
+  did probe.
+- **Failed ASICs appear only in `HostHealth`, not in `asics`.** An older
+  driver talking to a newer agent must not see an ASIC with no `unique_id`
+  or `chip_id` in the list it publishes devices from. The new driver builds
+  what it needs for a failed ASIC from the identity and enumeration facts
+  above.
+- **One aggregated `state`.** The agent combines its signals into one value;
+  the first signal is whether an expected ASIC probed. A single state keeps
+  the message stable as signals are added, and keeps the combining rule in
+  the component that understands the signals.
+- **Same stream.** One snapshot keeps topology and health consistent with
+  each other, and avoids a second slot against the agent's cap on open
+  watches (`RESOURCE_EXHAUSTED`).
+- **Emit on change of aggregated state only.** Probing does not flap, so
+  no hysteresis is needed yet. When richer signals arrive, the agent is the
+  place to debounce them, since it sees the raw readings.
+- **Backward compatible.** Both directions: the field is new and optional,
+  and nothing in `HostPhysicalTopology` changes meaning.
 
-### Questions for the fabric manager team
+### Deferred
 
-- **Which signals exist today?** The candidates for `HealthReason` are ARC
-  firmware heartbeat, temperature against throttle and shutdown thresholds,
-  DRAM training failures, PCIe link speed or width below expected, AER
-  errors, device reset in progress, firmware bundle mismatch across the
-  host, and a remote ASIC unreachable through its MMIO parent. The enum
-  should cover what the agent can actually observe, not this whole list.
-- **Who debounces?** Flapping links or temperatures near a threshold would
-  produce a snapshot per transition, each carrying the cluster descriptor
-  YAML. The agent sees raw telemetry and is the better place for
-  hysteresis; failing that, health-only updates could omit the YAML.
-- **What does fallback discovery know?** If `DISCOVERY_METHOD_FALLBACK`
-  means no telemetry, `telemetry_available = false` lets the driver report
-  `UNKNOWN` rather than infer health it does not have.
+- **Link health.** Without it, a mesh whose link went down still disappears
+  because mesh gating uses `local_connections`, which lists only links that
+  came up. Mesh health in the first version is therefore the health of its
+  chips only. Expected links from the FSD, with a state, would fix this; the
+  endpoints would also be keyed by `(tray_id, asic_location, channel)`,
+  since `unique_id` is absent exactly when a link is down.
+- **Richer reasons and `DEGRADED`.** Thermals, ARC heartbeat, DRAM
+  training, PCIe link state and so on, as the agent gains signals.
+- **Freshness.** Whether the agent's health view is current. Probe results
+  do not go stale the way telemetry does, so this waits for a signal that
+  can.
+
 
 ## Phase 1 — health stream from what we already know
 
@@ -240,26 +268,38 @@ smoke test in which a chip disappears and the stream reports it.
 
 ## Phase 2 — consume fabric manager health
 
-Depends on the proto addition above.
+Depends on the proto addition above, and on stable device names.
 
+- **Stable device names (prerequisite).** Names are built from `chip_id`
+  today (`tt-<chip_id>`; meshes use the origin chip's), and `chip_id` can be
+  reordered among devices and does not exist for an ASIC that failed to
+  probe. Health reported against a name that can move between chips is
+  wrong, and a failed ASIC could not be named at all. Names move to
+  `(tray_id, asic_location)`: chips become `tt-<tray>-<location>`, and
+  meshes take the tray and location of their origin chip where they take
+  its `chip_id` now. Trays keep `tt-tray-<id>`. The breaking change is
+  accepted, since nothing is known to depend on the naming, so there is no
+  migration path. It reaches checkpoints, CDI device ids and the `chipIDs`
+  mesh attribute, so it lands on its own, before the health work.
 - **Vendor the new proto** and carry `HostHealth` through
   `fabricmanager.Snapshot`.
-- **Keep failed ASICs published.** Because the agent now reports them, they
-  go through the normal bundling and naming path; only their health
-  differs. Prepare does not refuse an unhealthy device: a pod that
-  tolerates the taint has asked for it.
-- **Validate meshes against expected links, judge them by actual links.**
-  Mesh gating checks adjacency against links with `expected` set, so a mesh
-  is published whenever the host is cabled the way the grouping says; a
-  down link then makes it unhealthy instead of making it disappear. The
-  check is still independent of our hardcoded pairing — the expected links
-  come from the PSD, the pairing from the PGD — so it keeps its value as
-  a guard against a wrong grouping table.
-- **Staleness.** `last_checked_unix` older than a threshold, or
-  `telemetry_available == false`, turns every device `UNKNOWN`.
-- **Drop the phase 1 tombstones.** Gone-but-remembered devices were a
-  stand-in for the agent's expected inventory; once it exists, a device the
-  agent does not report is genuinely absent.
+- **Keep failed ASICs published.** For each unhealthy `AsicHealth` with no
+  matching entry in `asics`, the driver builds a device from the identity
+  and enumeration facts, with attributes it cannot know omitted. Prepare
+  does not refuse an unhealthy device: a pod that tolerates the taint has
+  asked for it. Nothing can be bundled onto a failed MMIO chip, so remote
+  ASICs that depended on it are reported unhealthy with it.
+- **Health comes from the agent when present.** A snapshot with `health`
+  makes each device's health that of its chips, worst first. A snapshot
+  without it leaves the Phase 1 behaviour in place, so an older agent still
+  works.
+- **Meshes** are judged by their chips only until link health exists. The
+  existing adjacency gating on `local_connections` stays.
+- **Phase 1 tombstones stay.** They are still the only signal for a device
+  the agent no longer lists, and for an agent without `health`. They are
+  dropped only for devices the agent reports through `health`, which it
+  keeps listing.
+
 
 ## Phase 3 — taints
 
@@ -308,4 +348,6 @@ tainted chip blocks the tray and mesh over it; and the dropped-fields path.
   `None` may be the better default effect.
 - **Remote ASICs.** A chip bundle's health takes the worst of its MMIO and
   remote ASICs. Is a remote ASIC failing always fatal to the bundle, or can
-  the MMIO chip still be useful on its own?
+  the MMIO chip still be useful on its own? The other direction is settled:
+  the agent reports each remote ASIC's own probe result, and remote ASICs
+  behind a failed MMIO chip are unhealthy with it.
