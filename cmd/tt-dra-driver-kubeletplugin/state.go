@@ -544,9 +544,16 @@ func (s *DeviceState) refreshContainerEdits(preparedDevices profiles.PreparedDev
 	}
 	fresh := make(profiles.PreparedDevices, len(preparedDevices))
 	for i, device := range preparedDevices {
-		cp := *device
-		cp.ContainerEdits = edits[device.DeviceName]
-		fresh[i] = &cp
+		fresh[i] = &profiles.PreparedDevice{
+			Device: drapbv1.Device{
+				RequestNames: device.RequestNames,
+				PoolName:     device.PoolName,
+				DeviceName:   device.DeviceName,
+				CdiDeviceIds: device.CdiDeviceIds,
+			},
+			ContainerEdits: edits[device.DeviceName],
+			AdminAccess:    device.AdminAccess,
+		}
 	}
 	return fresh, nil
 }
