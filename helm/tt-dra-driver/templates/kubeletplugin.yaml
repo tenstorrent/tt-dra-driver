@@ -90,6 +90,12 @@ spec:
         # Whether to advertise known multi-chip meshes alongside them.
         - name: ENABLE_MESH_DEVICES
           value: {{ .Values.kubeletPlugin.meshDevices | quote }}
+        {{- if .Values.kubeletPlugin.mock }}
+        # Suppress host device access in CDI specs for testing on nodes
+        # without Tenstorrent hardware. Never set in production.
+        - name: MOCK
+          value: "true"
+        {{- end }}
         {{- if .Values.kubeletPlugin.containers.plugin.healthcheckPort }}
         - name: HEALTHCHECK_PORT
           value: {{ .Values.kubeletPlugin.containers.plugin.healthcheckPort | quote }}

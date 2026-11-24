@@ -125,6 +125,13 @@ var cases = []renderCase{
 			"including for the DeviceClass and the CEL selector inside it.",
 		set: []string{"driverName=dra.example.com"},
 	},
+	{
+		name: "mock",
+		why: "Mock mode injects MOCK=true so the driver suppresses host " +
+			"device access in CDI specs, letting pods start on nodes without " +
+			"real Tenstorrent hardware.",
+		set: []string{"kubeletPlugin.mock=true"},
+	},
 }
 
 func TestChartRenders(t *testing.T) {

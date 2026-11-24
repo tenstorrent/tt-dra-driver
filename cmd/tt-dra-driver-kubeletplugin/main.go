@@ -65,6 +65,7 @@ type Flags struct {
 	fabricManagerAgentAddress     string
 	enableTrayDevices             bool
 	enableMeshDevices             bool
+	mock                          bool
 }
 
 // Config is the runtime configuration assembled from Flags.
@@ -83,6 +84,7 @@ var validProfiles = map[string]func(flags Flags, agent fabricmanager.TopologyCli
 		return tenstorrent.NewProfile(f.nodeName, agent, tenstorrent.Options{
 			TrayDevices: f.enableTrayDevices,
 			MeshDevices: f.enableMeshDevices,
+			Mock:        f.mock,
 		})
 	},
 }
@@ -203,6 +205,14 @@ func newApp() *cli.App {
 			Usage:       "UID of the pod (used for seamless upgrades to create unique socket names).",
 			Destination: &flags.podUID,
 			EnvVars:     []string{"POD_UID"},
+		},
+		&cli.BoolFlag{
+			Name: "mock",
+			Usage: "Suppress host device access in CDI specs. " +
+				"PrepareResourceClaims succeeds and containers start without real /dev/tenstorrent devices on the host. " +
+				"Intended for testing the DRA scheduling and prepare/unprepare flow on nodes without Tenstorrent hardware.",
+			Destination: &flags.mock,
+			EnvVars:     []string{"MOCK"},
 		},
 	}
 	cliFlags = append(cliFlags, flags.kubeClientConfig.Flags()...)

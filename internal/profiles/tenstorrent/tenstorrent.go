@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -185,6 +186,13 @@ type Options struct {
 	// Mesh devices are composites like tray devices and carry the same
 	// requirement on shared counters.
 	MeshDevices bool
+
+	// Mock suppresses all host-side device access in CDI specs. When
+	// set, ApplyConfig returns empty container edits (no /dev/tenstorrent
+	// device nodes, no hugepage mounts), so PrepareResourceClaims
+	// succeeds and containers start on nodes without Tenstorrent hardware.
+	// Intended for testing the DRA scheduling and prepare/unprepare flow.
+	Mock bool
 }
 
 // Profile is the Tenstorrent device profile.
@@ -198,6 +206,7 @@ type Profile struct {
 	topology    fabricmanager.TopologyClient
 	trayDevices bool
 	meshDevices bool
+	mock        bool
 
 	mu           sync.RWMutex
 	unitByDevice map[string]allocatableUnit
@@ -215,6 +224,7 @@ func NewProfile(nodeName string, topology fabricmanager.TopologyClient, opts Opt
 		topology:     topology,
 		trayDevices:  opts.TrayDevices,
 		meshDevices:  opts.MeshDevices,
+		mock:         opts.Mock,
 		unitByDevice: make(map[string]allocatableUnit),
 	}
 }
@@ -369,7 +379,13 @@ func failedWatch(err error) profiles.DeviceWatch {
 // filesystems on the host; these are required by every ASIC and are
 // therefore declared once at the "common" level instead of being duplicated
 // per device.
+//
+// In mock mode no host paths are injected, so the common spec carries only
+// the env vars that NewCDIHandler writes unconditionally.
 func (p *Profile) CommonContainerEdits() *cdiapi.ContainerEdits {
+	if p.mock {
+		return nil
+	}
 	return &cdiapi.ContainerEdits{
 		ContainerEdits: &cdispec.ContainerEdits{
 			Mounts: []*cdispec.Mount{
@@ -413,6 +429,9 @@ func (p *Profile) Validate(config runtime.Object) error {
 // for a tray device. Because applyTopology only ever anchors units on
 // MMIO-capable ASICs (with any non-MMIO siblings bundled in), each bundle
 // corresponds to exactly one host-visible character device.
+//
+// In mock mode the device node entries are omitted so that PrepareResourceClaims
+// succeeds and containers start on nodes without /dev/tenstorrent devices.
 func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.DeviceRequestAllocationResult) (profiles.PerDeviceCDIContainerEdits, error) {
 	if config != nil {
 		return nil, errors.New("tenstorrent profile: opaque configuration is not supported yet")
@@ -428,6 +447,7 @@ func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devi
 			return nil, fmt.Errorf("tenstorrent profile: device %q is not in the latest topology reported by the fabric manager agent", result.Device)
 		}
 		deviceNodes := make([]*cdispec.DeviceNode, 0, len(unit.bundles))
+		nodeIDs := make([]string, 0, len(unit.bundles))
 		for _, bundle := range unit.bundles {
 			// Defensive: applyTopology is responsible for anchoring every
 			// unit on an MMIO chip. If a non-MMIO one ever leaks through,
@@ -437,17 +457,22 @@ func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devi
 				return nil, fmt.Errorf("tenstorrent profile: %s device %q (tray %d) resolves to non-MMIO ASIC chip %d, which should never appear in the ResourceSlice",
 					unit.kind, result.Device, unit.trayID, bundle.mmio.GetChipId())
 			}
-			deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
-				Path:        fmt.Sprintf(devicePathFmt, bundle.mmio.GetDeviceNodeId()),
-				Type:        "c",
-				Permissions: "rw",
-			})
+			nodeID := bundle.mmio.GetDeviceNodeId()
+			if p.mock {
+				nodeIDs = append(nodeIDs, fmt.Sprintf("%d", nodeID))
+			} else {
+				deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
+					Path:        fmt.Sprintf(devicePathFmt, nodeID),
+					Type:        "c",
+					Permissions: "rw",
+				})
+			}
 		}
-		edits[result.Device] = &cdiapi.ContainerEdits{
-			ContainerEdits: &cdispec.ContainerEdits{
-				DeviceNodes: deviceNodes,
-			},
+		containerEdits := &cdispec.ContainerEdits{DeviceNodes: deviceNodes}
+		if p.mock {
+			containerEdits.Env = []string{"TT_DRA_MOCK_DEVICE_NODE_IDS=" + strings.Join(nodeIDs, ",")}
 		}
+		edits[result.Device] = &cdiapi.ContainerEdits{ContainerEdits: containerEdits}
 	}
 	return edits, nil
 }

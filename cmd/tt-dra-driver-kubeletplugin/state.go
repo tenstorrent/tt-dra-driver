@@ -173,7 +173,12 @@ func (s *DeviceState) reconcileCDISpecs(ctx context.Context) error {
 			continue
 		}
 		validClaimUIDs = append(validClaimUIDs, claimUID)
-		if err := s.cdi.CreateClaimSpecFile(claimUID, preparedDevices); err != nil {
+		freshDevices, err := s.refreshContainerEdits(preparedDevices)
+		if err != nil {
+			logger.Error(err, "Not regenerating CDI spec for checkpointed claim: could not refresh container edits", "uid", claimUID)
+			continue
+		}
+		if err := s.cdi.CreateClaimSpecFile(claimUID, freshDevices); err != nil {
 			return fmt.Errorf("unable to create CDI spec file for claim %v: %w", claimUID, err)
 		}
 		written++
@@ -292,12 +297,16 @@ func (s *DeviceState) Prepare(ctx context.Context, claim *resourceapi.ResourceCl
 
 		// The checkpoint says this claim is prepared, but it outlives the CDI
 		// root across a node reboot, so the spec file the runtime resolves the
-		// returned CDI device names against may no longer exist. The spec is a
-		// pure function of the checkpointed devices, so rewriting it is cheap
-		// and idempotent; not rewriting it means handing the kubelet device
-		// names that resolve to nothing.
+		// returned CDI device names against may no longer exist. ContainerEdits
+		// are re-applied from the active profile rather than taken verbatim from
+		// the checkpoint, so a restart with --mock toggled produces the correct
+		// spec rather than reusing stale edits.
 		specStart := time.Now()
-		if err := s.cdi.CreateClaimSpecFile(claimUID, preparedDevices); err != nil {
+		freshDevices, err := s.refreshContainerEdits(preparedDevices)
+		if err != nil {
+			return nil, fmt.Errorf("unable to refresh CDI container edits for claim: %v", err)
+		}
+		if err := s.cdi.CreateClaimSpecFile(claimUID, freshDevices); err != nil {
 			return nil, fmt.Errorf("unable to recreate CDI spec file for claim: %v", err)
 		}
 		cdiSpecWrite := time.Since(specStart)
@@ -502,6 +511,51 @@ func (s *DeviceState) validatePreparedDevices(claimUID string, preparedDevices p
 		}
 	}
 	return nil
+}
+
+// refreshContainerEdits re-applies the active profile configuration to a set
+// of checkpointed prepared devices and returns a copy with fresh ContainerEdits.
+//
+// ContainerEdits are stored in the checkpoint so that CDI specs can be
+// regenerated after a node reboot without re-preparing the claim. However,
+// they reflect the driver configuration at prepare time, so a restart with
+// different flags (e.g. --mock toggled) would otherwise leave stale edits in
+// regenerated specs — normal→mock claims would still get /dev/tenstorrent
+// nodes, mock→normal claims would still lack them. Calling this before any
+// CreateClaimSpecFile that reads from checkpoint data ensures the written spec
+// always matches the active configuration.
+func (s *DeviceState) refreshContainerEdits(preparedDevices profiles.PreparedDevices) (profiles.PreparedDevices, error) {
+	results := make([]*resourceapi.DeviceRequestAllocationResult, 0, len(preparedDevices))
+	for _, device := range preparedDevices {
+		req := ""
+		if len(device.RequestNames) > 0 {
+			req = device.RequestNames[0]
+		}
+		results = append(results, &resourceapi.DeviceRequestAllocationResult{
+			Request: req,
+			Driver:  s.driverName,
+			Pool:    device.PoolName,
+			Device:  device.DeviceName,
+		})
+	}
+	edits, err := s.configHandler.ApplyConfig(nil, results)
+	if err != nil {
+		return nil, err
+	}
+	fresh := make(profiles.PreparedDevices, len(preparedDevices))
+	for i, device := range preparedDevices {
+		fresh[i] = &profiles.PreparedDevice{
+			Device: drapbv1.Device{
+				RequestNames: device.RequestNames,
+				PoolName:     device.PoolName,
+				DeviceName:   device.DeviceName,
+				CdiDeviceIds: device.CdiDeviceIds,
+			},
+			ContainerEdits: edits[device.DeviceName],
+			AdminAccess:    device.AdminAccess,
+		}
+	}
+	return fresh, nil
 }
 
 func (s *DeviceState) unprepareDevices(_ string, _ profiles.PreparedDevices) error {
