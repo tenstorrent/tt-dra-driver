@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/klog/v2"
+	drahealthv1alpha1 "k8s.io/kubelet/pkg/apis/dra-health/v1alpha1"
 	drapb "k8s.io/kubelet/pkg/apis/dra/v1"
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 
@@ -97,6 +98,7 @@ type harness struct {
 
 	reg    registerapi.RegistrationClient
 	dra    drapb.DRAPluginClient
+	res    drahealthv1alpha1.DRAResourceHealthClient
 	health grpc_health_v1.HealthClient
 
 	fatalMu sync.Mutex
@@ -327,11 +329,74 @@ func (h *harness) connect() {
 
 	draSocket := h.draSocketPath()
 	h.waitForSocket(draSocket)
-	h.dra = drapb.NewDRAPluginClient(h.dial("unix://" + draSocket))
+	draConn := h.dial("unix://" + draSocket)
+	h.dra = drapb.NewDRAPluginClient(draConn)
+	h.res = drahealthv1alpha1.NewDRAResourceHealthClient(draConn)
 
 	if h.healthcheckPort > 0 {
 		h.health = grpc_health_v1.NewHealthClient(
 			h.dial(net.JoinHostPort("127.0.0.1", strconv.Itoa(h.healthcheckPort))))
+	}
+}
+
+// deviceHealthStream is an open NodeWatchResources stream, read the way
+// kubelet reads it.
+type deviceHealthStream struct {
+	h      *harness
+	stream drahealthv1alpha1.DRAResourceHealth_NodeWatchResourcesClient
+}
+
+// watchDeviceHealth opens a NodeWatchResources stream, which stays open until
+// the harness stops.
+func (h *harness) watchDeviceHealth() *deviceHealthStream {
+	h.t.Helper()
+
+	stream, err := h.res.NodeWatchResources(h.ctx, &drahealthv1alpha1.NodeWatchResourcesRequest{})
+	if err != nil {
+		h.t.Fatalf("NodeWatchResources: %v", err)
+	}
+	return &deviceHealthStream{h: h, stream: stream}
+}
+
+// next returns the next snapshot, as device name to status.
+func (s *deviceHealthStream) next() map[string]drahealthv1alpha1.HealthStatus {
+	s.h.t.Helper()
+
+	type result struct {
+		resp *drahealthv1alpha1.NodeWatchResourcesResponse
+		err  error
+	}
+	got := make(chan result, 1)
+	go func() {
+		resp, err := s.stream.Recv()
+		got <- result{resp, err}
+	}()
+	select {
+	case r := <-got:
+		if r.err != nil {
+			s.h.t.Fatalf("health stream: %v", r.err)
+		}
+		statuses := make(map[string]drahealthv1alpha1.HealthStatus)
+		for _, d := range r.resp.GetDevices() {
+			if d.GetDevice().GetPoolName() != testNodeName {
+				s.h.t.Errorf("health reported for pool %q, want the node's pool %q", d.GetDevice().GetPoolName(), testNodeName)
+			}
+			statuses[d.GetDevice().GetDeviceName()] = d.GetHealth()
+		}
+		return statuses
+	case <-time.After(10 * time.Second):
+		s.h.t.Fatal("timed out waiting for a health snapshot")
+		return nil
+	}
+}
+
+// nextWhere reads snapshots until one satisfies ok, returning it.
+func (s *deviceHealthStream) nextWhere(ok func(map[string]drahealthv1alpha1.HealthStatus) bool) map[string]drahealthv1alpha1.HealthStatus {
+	s.h.t.Helper()
+	for {
+		if statuses := s.next(); ok(statuses) {
+			return statuses
+		}
 	}
 }
 

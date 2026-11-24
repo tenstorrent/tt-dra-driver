@@ -116,18 +116,23 @@ func deviceNames(resources resourceslice.DriverResources) []string {
 	return names
 }
 
-func recvResources(t *testing.T, watch profiles.DeviceWatch) resourceslice.DriverResources {
+func recvUpdate(t *testing.T, watch profiles.DeviceWatch) profiles.DeviceUpdate {
 	t.Helper()
 	select {
-	case resources, ok := <-watch.Updates():
+	case update, ok := <-watch.Updates():
 		if !ok {
-			t.Fatal("device watch closed while resources were expected")
+			t.Fatal("device watch closed while an update was expected")
 		}
-		return resources
+		return update
 	case <-time.After(recvTimeout):
-		t.Fatal("timed out waiting for resources")
-		return resourceslice.DriverResources{}
+		t.Fatal("timed out waiting for an update")
+		return profiles.DeviceUpdate{}
 	}
+}
+
+func recvResources(t *testing.T, watch profiles.DeviceWatch) resourceslice.DriverResources {
+	t.Helper()
+	return recvUpdate(t, watch).Resources
 }
 
 // sendSnapshot hands a snapshot to the watch under test. The bound matters:
@@ -1006,5 +1011,98 @@ func TestAllocationChipClassIgnoresTrays(t *testing.T) {
 	want := []string{"tt-0", "tt-2", "tt-3"}
 	if !slices.Equal(got, want) {
 		t.Errorf("allocated devices = %v, want %v", got, want)
+	}
+}
+
+// TestWatchDevicesReportsHealth checks the signals phase 1 has: reported
+// devices are healthy, and one that stops being reported stays in the health
+// map as unhealthy, because a pod may still hold it, until it comes back.
+func TestWatchDevicesReportsHealth(t *testing.T) {
+	topology := newFakeTopologyWatch()
+	profile := NewProfile(testNodeName, &fakeTopologyClient{watch: topology}, Options{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watch := profile.WatchDevices(ctx)
+
+	sendSnapshot(t, topology, usableSnapshot(0, 1))
+	both := recvUpdate(t, watch)
+	names := deviceNames(both.Resources)
+	if len(names) != 2 {
+		t.Fatalf("first update has devices %v, want two", names)
+	}
+	for _, name := range names {
+		if got := both.Health[name].State; got != profiles.HealthHealthy {
+			t.Errorf("%s is %v, want Healthy", name, got)
+		}
+	}
+
+	sendSnapshot(t, topology, usableSnapshot(0))
+	lost := recvUpdate(t, watch)
+	if got := deviceNames(lost.Resources); len(got) != 1 || got[0] != names[0] {
+		t.Fatalf("second update has devices %v, want only %s", got, names[0])
+	}
+	if got := lost.Health[names[0]].State; got != profiles.HealthHealthy {
+		t.Errorf("%s is %v, want Healthy", names[0], got)
+	}
+	gone := lost.Health[names[1]]
+	if gone.State != profiles.HealthUnhealthy || gone.Reason != reasonNotReported || gone.Since.IsZero() {
+		t.Errorf("%s has health %+v, want Unhealthy for %q with a start time", names[1], gone, reasonNotReported)
+	}
+
+	sendSnapshot(t, topology, usableSnapshot(0, 1))
+	back := recvUpdate(t, watch)
+	if got := back.Health[names[1]].State; got != profiles.HealthHealthy {
+		t.Errorf("%s is %v after returning, want Healthy", names[1], got)
+	}
+}
+
+// TestWatchDevicesReportsUnknownWhenBlind checks that an agent which cannot be
+// reached, or has no usable topology, makes every device unknown, without
+// touching what is published and without clearing the memory of a device that
+// is gone.
+func TestWatchDevicesReportsUnknownWhenBlind(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		snapshot   fabricmanager.Snapshot
+		wantReason string
+	}{
+		{
+			name:       "agent unreachable",
+			snapshot:   fabricmanager.Snapshot{Unreachable: errors.New("connection refused")},
+			wantReason: reasonAgentUnreachable,
+		},
+		{
+			name:       "discovery not finished",
+			snapshot:   fabricmanager.Snapshot{Status: agentpb.GetTopologyStatus_TOPOLOGY_NOT_DISCOVERED},
+			wantReason: reasonTopologyUnusable,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			topology := newFakeTopologyWatch()
+			profile := NewProfile(testNodeName, &fakeTopologyClient{watch: topology}, Options{})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			watch := profile.WatchDevices(ctx)
+
+			// Nothing is known yet, so nothing is reported.
+			sendSnapshot(t, topology, tc.snapshot)
+			sendSnapshot(t, topology, usableSnapshot(0, 1))
+			names := deviceNames(recvResources(t, watch))
+			sendSnapshot(t, topology, usableSnapshot(0))
+			recvUpdate(t, watch)
+
+			sendSnapshot(t, topology, tc.snapshot)
+			blind := recvUpdate(t, watch)
+			if got := deviceNames(blind.Resources); len(got) != 1 || got[0] != names[0] {
+				t.Errorf("devices are %v while blind, want the last published set [%s]", got, names[0])
+			}
+			for _, name := range names {
+				if h := blind.Health[name]; h.State != profiles.HealthUnknown || h.Reason != tc.wantReason || h.Message == "" {
+					t.Errorf("%s has health %+v, want Unknown for %q with a message", name, h, tc.wantReason)
+				}
+			}
+		})
 	}
 }

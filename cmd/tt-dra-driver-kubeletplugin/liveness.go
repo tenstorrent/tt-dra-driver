@@ -40,9 +40,9 @@ import (
 	registerapi "k8s.io/kubelet/pkg/apis/pluginregistration/v1"
 )
 
-// healthcheck exposes a gRPC health-check endpoint that probes the kubelet
+// liveness exposes a gRPC health-check endpoint that probes the kubelet
 // registration and DRA sockets owned by this driver.
-type healthcheck struct {
+type liveness struct {
 	grpc_health_v1.UnimplementedHealthServer
 
 	server *grpc.Server
@@ -52,9 +52,9 @@ type healthcheck struct {
 	draClient drapb.DRAPluginClient
 }
 
-// startHealthcheck starts the gRPC healthcheck service when configured. It
+// startLiveness starts the gRPC liveness service when configured. It
 // returns nil if the service is disabled (negative port).
-func startHealthcheck(ctx context.Context, config *Config) (*healthcheck, error) {
+func startLiveness(ctx context.Context, config *Config) (*liveness, error) {
 	log := klog.FromContext(ctx)
 
 	port := config.flags.healthcheckPort
@@ -65,7 +65,7 @@ func startHealthcheck(ctx context.Context, config *Config) (*healthcheck, error)
 	addr := net.JoinHostPort("", strconv.Itoa(port))
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to listen for healthcheck service at %s: %w", addr, err)
+		return nil, fmt.Errorf("failed to listen for liveness service at %s: %w", addr, err)
 	}
 
 	regSockPath := (&url.URL{
@@ -105,7 +105,7 @@ func startHealthcheck(ctx context.Context, config *Config) (*healthcheck, error)
 	}
 
 	server := grpc.NewServer()
-	hc := &healthcheck{
+	hc := &liveness{
 		server:    server,
 		regClient: registerapi.NewRegistrationClient(regConn),
 		draClient: drapb.NewDRAPluginClient(draConn),
@@ -115,26 +115,26 @@ func startHealthcheck(ctx context.Context, config *Config) (*healthcheck, error)
 	hc.wg.Add(1)
 	go func() {
 		defer hc.wg.Done()
-		log.Info("starting healthcheck service", "addr", lis.Addr().String())
+		log.Info("starting liveness service", "addr", lis.Addr().String())
 		if err := server.Serve(lis); err != nil {
-			log.Error(err, "failed to serve healthcheck service", "addr", addr)
+			log.Error(err, "failed to serve liveness service", "addr", addr)
 		}
 	}()
 
 	return hc, nil
 }
 
-// Stop gracefully shuts down the healthcheck server.
-func (h *healthcheck) Stop(logger klog.Logger) {
+// Stop gracefully shuts down the liveness server.
+func (h *liveness) Stop(logger klog.Logger) {
 	if h.server != nil {
-		logger.Info("stopping healthcheck service")
+		logger.Info("stopping liveness service")
 		h.server.GracefulStop()
 	}
 	h.wg.Wait()
 }
 
 // Check implements grpc_health_v1.HealthServer.
-func (h *healthcheck) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
+func (h *liveness) Check(ctx context.Context, req *grpc_health_v1.HealthCheckRequest) (*grpc_health_v1.HealthCheckResponse, error) {
 	log := klog.FromContext(ctx)
 
 	knownServices := map[string]struct{}{"": {}, "liveness": {}}

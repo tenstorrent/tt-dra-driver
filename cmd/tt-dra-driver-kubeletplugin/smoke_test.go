@@ -36,6 +36,7 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 	resourceapi "k8s.io/api/resource/v1"
+	drahealthv1alpha1 "k8s.io/kubelet/pkg/apis/dra-health/v1alpha1"
 
 	topologypb "github.com/tenstorrent/tt-dra-driver/internal/fabricmanager/proto/topology"
 )
@@ -451,6 +452,40 @@ func TestSmokeRepublishesWhenADeviceDisappears(t *testing.T) {
 	// The surviving board is unaffected throughout.
 	surviving := h.allocate("claim-survivor", "tt-0")
 	h.mustPrepare(surviving)
+}
+
+// TestSmokeReportsHealthOfADeviceThatDisappears covers what the ResourceSlice
+// cannot say: a device that stops being reported is withdrawn from the slice,
+// but a pod already holding it has to be told it is broken, which is the
+// health stream's job.
+func TestSmokeReportsHealthOfADeviceThatDisappears(t *testing.T) {
+	h := startHarness(t, withTopology(twoBoardTopology()))
+	h.waitForPublishedDevices("tt-0", "tt-2")
+
+	stream := h.watchDeviceHealth()
+	got := stream.next()
+	for _, name := range []string{"tt-0", "tt-2"} {
+		if got[name] != drahealthv1alpha1.HealthStatus_HEALTHY {
+			t.Errorf("%s is %v on connect, want HEALTHY (all: %v)", name, got[name], got)
+		}
+	}
+
+	h.agent.setTopology(n300Topology())
+	got = stream.nextWhere(func(m map[string]drahealthv1alpha1.HealthStatus) bool {
+		return m["tt-2"] != drahealthv1alpha1.HealthStatus_HEALTHY
+	})
+	if got["tt-2"] != drahealthv1alpha1.HealthStatus_UNHEALTHY {
+		t.Errorf("tt-2 is %v after disappearing, want UNHEALTHY", got["tt-2"])
+	}
+	if got["tt-0"] != drahealthv1alpha1.HealthStatus_HEALTHY {
+		t.Errorf("tt-0 is %v, want it unaffected", got["tt-0"])
+	}
+
+	// A stream opened afterwards, as after a kubelet restart, starts from the
+	// same picture rather than from nothing.
+	if late := h.watchDeviceHealth().next(); late["tt-2"] != drahealthv1alpha1.HealthStatus_UNHEALTHY {
+		t.Errorf("a new stream sees tt-2 as %v, want UNHEALTHY", late["tt-2"])
+	}
 }
 
 // TestSmokeRecoversWhenTheAgentRestarts covers the agent going down under a
