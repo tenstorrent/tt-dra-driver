@@ -69,6 +69,11 @@ kubeletPlugin:
   # trayDevices relies on — so it carries the same DRAPartitionableDevices
   # requirement.
   meshDevices: true
+  # mock suppresses host device access in CDI specs so that
+  # PrepareResourceClaims succeeds and pods start on nodes without real
+  # Tenstorrent hardware. Requires the FM agent to run with a mocked cluster
+  # descriptor. Never set this in a production deployment.
+  mock: false
   priorityClassName: "system-node-critical"
   updateStrategy:
     type: RollingUpdate

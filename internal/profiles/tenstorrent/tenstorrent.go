@@ -45,6 +45,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -445,11 +446,8 @@ func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devi
 		if !ok {
 			return nil, fmt.Errorf("tenstorrent profile: device %q is not in the latest topology reported by the fabric manager agent", result.Device)
 		}
-		if p.mock {
-			edits[result.Device] = nil
-			continue
-		}
 		deviceNodes := make([]*cdispec.DeviceNode, 0, len(unit.bundles))
+		nodeIDs := make([]string, 0, len(unit.bundles))
 		for _, bundle := range unit.bundles {
 			// Defensive: applyTopology is responsible for anchoring every
 			// unit on an MMIO chip. If a non-MMIO one ever leaks through,
@@ -459,17 +457,22 @@ func (p *Profile) ApplyConfig(config runtime.Object, results []*resourceapi.Devi
 				return nil, fmt.Errorf("tenstorrent profile: %s device %q (tray %d) resolves to non-MMIO ASIC chip %d, which should never appear in the ResourceSlice",
 					unit.kind, result.Device, unit.trayID, bundle.mmio.GetChipId())
 			}
-			deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
-				Path:        fmt.Sprintf(devicePathFmt, bundle.mmio.GetDeviceNodeId()),
-				Type:        "c",
-				Permissions: "rw",
-			})
+			nodeID := bundle.mmio.GetDeviceNodeId()
+			if p.mock {
+				nodeIDs = append(nodeIDs, fmt.Sprintf("%d", nodeID))
+			} else {
+				deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
+					Path:        fmt.Sprintf(devicePathFmt, nodeID),
+					Type:        "c",
+					Permissions: "rw",
+				})
+			}
 		}
-		edits[result.Device] = &cdiapi.ContainerEdits{
-			ContainerEdits: &cdispec.ContainerEdits{
-				DeviceNodes: deviceNodes,
-			},
+		containerEdits := &cdispec.ContainerEdits{DeviceNodes: deviceNodes}
+		if p.mock {
+			containerEdits.Env = []string{"TT_DRA_MOCK_DEVICE_NODE_IDS=" + strings.Join(nodeIDs, ",")}
 		}
+		edits[result.Device] = &cdiapi.ContainerEdits{ContainerEdits: containerEdits}
 	}
 	return edits, nil
 }
